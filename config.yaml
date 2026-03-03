@@ -1,0 +1,35 @@
+# USV Disease Classifier Configuration
+# =====================================
+
+# Data settings
+mat_directory: "../DeepSqueak__output"  # Path to DeepSqueak MAT files
+labels_csv: "../labels.csv"              # Path to labels file (optional if labels in filenames)
+
+# Feature settings
+n_max_calls: 150       # Max calls per sample (pad/truncate to this)
+n_features: 5          # Features per call: [start_time, low_freq, duration, bandwidth, score]
+include_score: true    # Include detection score as feature
+normalize: true        # Z-score normalize features
+
+# Model settings
+model_type: "mlp"              # "mlp" or "attention"
+hidden_dims: [512, 256, 128]   # Hidden layer dimensions
+dropout: 0.3                   # Dropout probability
+use_batch_norm: true           # Use batch normalization
+
+# Training settings
+n_epochs: 100
+batch_size: 16
+learning_rate: 0.001
+weight_decay: 0.0001
+use_class_weights: true        # Handle class imbalance
+early_stopping_patience: 20
+
+# Data splits
+train_ratio: 0.7
+val_ratio: 0.15
+test_ratio: 0.15
+seed: 42
+
+# Output
+output_dir: "outputs"
