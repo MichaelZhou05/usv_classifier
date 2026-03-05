@@ -183,6 +183,7 @@ def train(config: dict) -> dict:
         "n_features": config.get("n_features", 5),
         "hidden_dims": config.get("hidden_dims", [512, 256, 128]),
         "dropout": config.get("dropout", 0.3),
+        "use_batch_norm": config.get("use_batch_norm", True),
     }
 
     model_type = config.get("model_type", "mlp")

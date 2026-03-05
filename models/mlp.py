@@ -204,6 +204,114 @@ class USVClassifierWithAttention(nn.Module):
         return attn_weights
 
 
+class USVSummaryClassifier(nn.Module):
+    """
+    Simple classifier using summary statistics instead of raw calls.
+
+    Much better for small datasets (< 200 samples).
+    Computes statistics like mean, std, min, max of call features.
+    """
+
+    def __init__(
+        self,
+        n_features: int = 5,
+        hidden_dims: list[int] = [32, 16],
+        dropout: float = 0.5,
+        **kwargs  # Accept and ignore extra args for compatibility
+    ):
+        super().__init__()
+
+        # 6 stats per feature: mean, std, min, max, median, count
+        # Plus additional: total_duration, call_rate
+        self.n_summary_features = n_features * 6 + 2
+
+        layers = []
+        prev_dim = self.n_summary_features
+
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim
+
+        layers.append(nn.Linear(prev_dim, 1))
+        self.network = nn.Sequential(*layers)
+
+    def _compute_summary(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute summary statistics from call features.
+
+        Args:
+            x: Input tensor of shape (batch, n_max_calls, n_features)
+
+        Returns:
+            Summary tensor of shape (batch, n_summary_features)
+        """
+        batch_size = x.shape[0]
+
+        # Mask for real calls (non-zero rows)
+        mask = ~torch.all(x == 0, dim=-1)  # (batch, n_max_calls)
+
+        summaries = []
+
+        for b in range(batch_size):
+            calls = x[b][mask[b]]  # (n_real_calls, n_features)
+            n_calls = calls.shape[0]
+
+            if n_calls == 0:
+                # No calls - use zeros
+                summary = torch.zeros(self.n_summary_features, device=x.device)
+            else:
+                stats = []
+                for f in range(calls.shape[1]):
+                    feat = calls[:, f]
+                    stats.extend([
+                        feat.mean(),
+                        feat.std() if n_calls > 1 else torch.tensor(0.0, device=x.device),
+                        feat.min(),
+                        feat.max(),
+                        feat.median(),
+                        torch.tensor(float(n_calls), device=x.device),  # count
+                    ])
+
+                # Additional features
+                durations = calls[:, 2]  # duration is feature index 2
+                total_duration = durations.sum()
+
+                # Estimate call rate (calls per second of recording)
+                # Using time span from first to last call
+                start_times = calls[:, 0]
+                time_span = start_times.max() - start_times.min() + durations.mean()
+                call_rate = n_calls / (time_span + 1e-6)
+
+                stats.extend([total_duration, call_rate])
+                summary = torch.stack(stats)
+
+            summaries.append(summary)
+
+        return torch.stack(summaries)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
+        if x.dim() == 2:
+            # Already flattened - reshape
+            # This shouldn't happen with summary model
+            pass
+
+        summary = self._compute_summary(x)
+        return self.network(summary)
+
+    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
+        """Get probability predictions."""
+        logits = self.forward(x)
+        return torch.sigmoid(logits)
+
+    def predict(self, x: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
+        """Get binary predictions."""
+        proba = self.predict_proba(x)
+        return (proba >= threshold).long()
+
+
 def get_model(
     model_type: str = "mlp",
     **kwargs
@@ -212,7 +320,7 @@ def get_model(
     Factory function to create models.
 
     Args:
-        model_type: One of "mlp" or "attention".
+        model_type: One of "mlp", "attention", or "summary".
         **kwargs: Arguments passed to model constructor.
 
     Returns:
@@ -222,5 +330,7 @@ def get_model(
         return USVClassifier(**kwargs)
     elif model_type == "attention":
         return USVClassifierWithAttention(**kwargs)
+    elif model_type == "summary":
+        return USVSummaryClassifier(**kwargs)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
