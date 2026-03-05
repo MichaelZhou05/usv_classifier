@@ -18,7 +18,7 @@ from models.mlp import get_model
 
 def load_trained_model(model_path: str, device: torch.device):
     """Load a trained model from checkpoint."""
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     config = checkpoint["config"]
 
     model_config = {

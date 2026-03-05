@@ -263,7 +263,7 @@ def train(config: dict) -> dict:
     print(f"Best epoch: {best_epoch} (val_loss: {best_val_loss:.4f})")
 
     # Load best model and evaluate on test set
-    checkpoint = torch.load(run_dir / "best_model.pt")
+    checkpoint = torch.load(run_dir / "best_model.pt", weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     test_metrics = evaluate(model, test_loader, criterion, device)
