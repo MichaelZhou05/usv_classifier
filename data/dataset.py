@@ -136,10 +136,11 @@ class USVDataset(Dataset):
             # Infer from filename
             for cd in self.call_data_list:
                 filename = cd.filename.lower()
-                if 'wildtype' in filename or 'wt' in filename:
-                    labels[cd.filename] = 0
-                elif 'twitcher' in filename or 'twi' in filename:
+                if 'twitcher' in filename or 'twi' in filename:
                     labels[cd.filename] = 1
+                elif 'wildtype' in filename or 'wt' in filename or 'het' in filename:
+                    # het (heterozygous) grouped with wildtype as healthy
+                    labels[cd.filename] = 0
                 else:
                     # Unknown - will be filtered out
                     pass
