@@ -1,11 +1,87 @@
 """
 MLP classifier for USV disease detection.
+
+Supports both binary classification (legacy) and multi-class classification
+with flexible input dimensions for enriched/pooled features.
 """
 
-from typing import Optional
+from typing import Optional, List
 
 import torch
 import torch.nn as nn
+
+
+class EnrichedUSVClassifier(nn.Module):
+    """
+    MLP classifier for pooled/enriched USV features.
+
+    Designed for use with EnrichedUSVDataset and modular pooling.
+    Supports multi-class classification (default: 3 classes).
+
+    This is the recommended model for small datasets as it:
+    1. Takes much smaller input (e.g., 11 features instead of 750)
+    2. Uses fewer parameters, reducing overfitting
+    3. Supports multi-class output with CrossEntropyLoss
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        n_classes: int = 3,
+        hidden_dims: List[int] = [32, 16],
+        dropout: float = 0.5,
+        use_batch_norm: bool = False,
+    ):
+        """
+        Args:
+            input_dim: Input dimension (from pooler.output_dim).
+            n_classes: Number of output classes.
+            hidden_dims: List of hidden layer dimensions.
+            dropout: Dropout probability.
+            use_batch_norm: Whether to use batch normalization.
+        """
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.n_classes = n_classes
+
+        layers = []
+        prev_dim = input_dim
+
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            if use_batch_norm:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim
+
+        # Output layer (n_classes logits for multi-class)
+        layers.append(nn.Linear(prev_dim, n_classes))
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor of shape (batch, input_dim).
+
+        Returns:
+            Logits of shape (batch, n_classes).
+        """
+        return self.network(x)
+
+    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
+        """Get probability predictions using softmax."""
+        logits = self.forward(x)
+        return torch.softmax(logits, dim=-1)
+
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        """Get class predictions (argmax)."""
+        logits = self.forward(x)
+        return torch.argmax(logits, dim=-1)
 
 
 class USVClassifier(nn.Module):
@@ -320,11 +396,17 @@ def get_model(
     Factory function to create models.
 
     Args:
-        model_type: One of "mlp", "attention", or "summary".
+        model_type: One of "mlp", "attention", "summary", or "enriched".
         **kwargs: Arguments passed to model constructor.
 
     Returns:
         Model instance.
+
+    Model types:
+        - "mlp": Standard MLP for concatenated call features (binary)
+        - "attention": MLP with attention mechanism (binary)
+        - "summary": Summary statistics model (binary)
+        - "enriched": MLP for pooled enriched features (multi-class)
     """
     if model_type == "mlp":
         return USVClassifier(**kwargs)
@@ -332,5 +414,8 @@ def get_model(
         return USVClassifierWithAttention(**kwargs)
     elif model_type == "summary":
         return USVSummaryClassifier(**kwargs)
+    elif model_type == "enriched":
+        return EnrichedUSVClassifier(**kwargs)
     else:
-        raise ValueError(f"Unknown model type: {model_type}")
+        raise ValueError(f"Unknown model type: {model_type}. "
+                        f"Available: mlp, attention, summary, enriched")

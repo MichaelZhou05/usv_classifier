@@ -1,0 +1,47 @@
+# USV Disease Classifier Configuration (Enriched Features Mode)
+# ================================================================
+#
+# This configuration uses enriched features from MATLAB (CalculateStats)
+# with modular pooling for 3-class classification.
+#
+# Prerequisites:
+#   1. Run ExportEnrichedFeatures.m in MATLAB to generate CSV files
+#   2. Place CSV files in the csv_directory path below
+
+# Data settings
+csv_directory: "../enriched_features"    # Path to enriched feature CSV files
+labels_csv: null                          # Path to labels file (optional if labels in filenames)
+n_features: 11                            # 11 enriched features from CalculateStats
+
+# Pooling strategy
+# Options: "average", "max", "statistics"
+# - average: Simple mean pooling (recommended, output_dim = 11)
+# - max: Max pooling (output_dim = 11)
+# - statistics: Multi-stat pooling (mean, std, min, max, median; output_dim = 55)
+pooler: "average"
+
+# Classification settings
+n_classes: 3                              # 3-class: twitcher, wildtype, heterozygous
+normalize: true                           # Z-score normalize pooled features
+
+# Model settings (for enriched features, uses EnrichedUSVClassifier)
+hidden_dims: [32, 16]                     # Smaller network for small dataset
+dropout: 0.5                              # Higher dropout to prevent overfitting
+use_batch_norm: false                     # Disable for small batches
+
+# Training settings
+n_epochs: 200
+batch_size: 8                             # Smaller batch size
+learning_rate: 0.0001                     # Slower learning rate
+weight_decay: 0.01                        # More regularization
+use_class_weights: true                   # Handle class imbalance
+early_stopping_patience: 30               # More patience
+
+# Data splits
+train_ratio: 0.7
+val_ratio: 0.15
+test_ratio: 0.15
+seed: 42
+
+# Output
+output_dir: "outputs"

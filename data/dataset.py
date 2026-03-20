@@ -1,10 +1,12 @@
 """
 PyTorch Dataset for USV classification.
+
+Supports both legacy MAT file loading and new enriched CSV features with pooling.
 """
 
 import os
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Union
 
 import numpy as np
 import pandas as pd
@@ -12,7 +14,44 @@ import torch
 from torch.utils.data import Dataset
 
 from .mat_parser import load_deepsqueak_mat, load_all_mat_files, CallData
+from .enriched_parser import load_enriched_csv, load_all_enriched_csv, EnrichedCallData, get_recording_name
 from .preprocessing import pad_or_truncate, normalize_features, sort_calls_by_time
+
+
+# 3-class label mapping
+LABEL_MAP = {
+    'twitcher': 0, 'twi': 0,
+    'wildtype': 1, 'wt': 1,
+    'heterozygous': 2, 'het': 2,
+}
+
+LABEL_NAMES = {0: 'twitcher', 1: 'wildtype', 2: 'heterozygous'}
+
+
+def infer_label_from_filename(filename: str, n_classes: int = 3) -> int:
+    """
+    Infer class label from filename.
+
+    Args:
+        filename: The filename to parse.
+        n_classes: Number of classes (2 or 3).
+
+    Returns:
+        Class label (0, 1, or 2 for 3-class; 0 or 1 for 2-class).
+
+    Raises:
+        ValueError: If no label pattern is found in filename.
+    """
+    filename_lower = filename.lower()
+
+    for pattern, label in LABEL_MAP.items():
+        if pattern in filename_lower:
+            if n_classes == 2:
+                # Binary: twitcher=1, others=0
+                return 1 if label == 0 else 0
+            return label
+
+    raise ValueError(f"Cannot infer label from: {filename}")
 
 
 class USVDataset(Dataset):
@@ -217,8 +256,196 @@ class USVDataset(Dataset):
         return torch.tensor(weights.get(1, 1.0), dtype=torch.float32)
 
 
+class EnrichedUSVDataset(Dataset):
+    """
+    PyTorch Dataset for USV classification using enriched features with pooling.
+
+    This dataset loads pre-computed enriched features from CSV files (exported
+    from MATLAB) and applies a pooling strategy to create fixed-size representations.
+
+    This is the recommended approach for small datasets as it:
+    1. Uses richer, domain-specific features from CalculateStats
+    2. Applies principled pooling instead of concatenate-and-flatten
+    3. Results in much smaller input dimensions, reducing overfitting
+    """
+
+    def __init__(
+        self,
+        csv_directory: str,
+        labels_csv: Optional[str] = None,
+        pooler: Optional['CallPooler'] = None,
+        n_classes: int = 3,
+        normalize: bool = True,
+        feature_mean: Optional[np.ndarray] = None,
+        feature_std: Optional[np.ndarray] = None,
+        transform: Optional[Callable] = None,
+    ):
+        """
+        Args:
+            csv_directory: Path to directory containing enriched feature CSV files.
+            labels_csv: Path to CSV with columns [filename, label].
+                        If None, tries to infer labels from filenames.
+            pooler: CallPooler instance for aggregating call features.
+                    If None, uses AveragePooler with n_features=11.
+            n_classes: Number of output classes (2 or 3).
+            normalize: Whether to z-score normalize pooled features.
+            feature_mean: Pre-computed mean for normalization (for val/test sets).
+            feature_std: Pre-computed std for normalization (for val/test sets).
+            transform: Optional transform to apply to features.
+        """
+        from ..pooling import PoolerRegistry
+
+        self.csv_directory = Path(csv_directory)
+        self.n_classes = n_classes
+        self.normalize = normalize
+        self.transform = transform
+
+        # Set up pooler
+        if pooler is None:
+            self.pooler = PoolerRegistry.get("average", n_features=11)
+        else:
+            self.pooler = pooler
+
+        # Load all CSV files
+        self.call_data_list = load_all_enriched_csv(csv_directory)
+
+        if len(self.call_data_list) == 0:
+            raise ValueError(f"No CSV files found in {csv_directory}")
+
+        # Load or infer labels
+        self.labels = self._load_labels(labels_csv)
+
+        # Pool features from all recordings
+        self.features_list = []
+        self.valid_indices = []
+
+        for i, cd in enumerate(self.call_data_list):
+            recording_name = get_recording_name(cd.filename)
+
+            # Try to match by filename or recording name
+            label = self.labels.get(cd.filename) or self.labels.get(recording_name)
+            if label is None:
+                print(f"Warning: No label for {cd.filename}, skipping")
+                continue
+
+            if cd.n_calls == 0:
+                print(f"Warning: No calls in {cd.filename}, skipping")
+                continue
+
+            # Get feature matrix and pool
+            features = cd.get_feature_matrix()  # (n_calls, 11)
+            pooled = self.pooler.pool(features)  # (output_dim,)
+
+            self.features_list.append(pooled)
+            self.valid_indices.append(i)
+
+        if len(self.features_list) == 0:
+            raise ValueError("No valid samples after filtering")
+
+        self.features_list = np.array(self.features_list)
+
+        # Compute or use provided normalization stats
+        if normalize:
+            if feature_mean is None or feature_std is None:
+                self.feature_mean = self.features_list.mean(axis=0)
+                self.feature_std = self.features_list.std(axis=0)
+                self.feature_std = np.maximum(self.feature_std, 1e-8)
+            else:
+                self.feature_mean = feature_mean
+                self.feature_std = feature_std
+
+            # Apply normalization
+            self.processed_features = (
+                self.features_list - self.feature_mean
+            ) / self.feature_std
+        else:
+            self.feature_mean = None
+            self.feature_std = None
+            self.processed_features = self.features_list
+
+        # Extract labels in order
+        self.processed_labels = np.array([
+            self.labels.get(self.call_data_list[i].filename) or
+            self.labels.get(get_recording_name(self.call_data_list[i].filename))
+            for i in self.valid_indices
+        ])
+
+    def _load_labels(self, labels_csv: Optional[str]) -> dict:
+        """Load labels from CSV or infer from filenames."""
+        labels = {}
+
+        if labels_csv is not None and os.path.exists(labels_csv):
+            df = pd.read_csv(labels_csv)
+            for _, row in df.iterrows():
+                labels[row['filename']] = int(row['label'])
+        else:
+            # Infer from filename using 3-class mapping
+            for cd in self.call_data_list:
+                try:
+                    label = infer_label_from_filename(cd.filename, self.n_classes)
+                    labels[cd.filename] = label
+                    # Also add without _features suffix
+                    recording_name = get_recording_name(cd.filename)
+                    labels[recording_name] = label
+                except ValueError:
+                    pass  # Unknown - will be filtered out
+
+        return labels
+
+    def __len__(self) -> int:
+        return len(self.processed_features)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.processed_features[idx].copy()
+        label = self.processed_labels[idx]
+
+        if self.transform is not None:
+            features = self.transform(features)
+
+        features = torch.tensor(features, dtype=torch.float32)
+        label = torch.tensor(label, dtype=torch.long)  # Long for CrossEntropyLoss
+
+        return features, label
+
+    def get_filename(self, idx: int) -> str:
+        """Get original filename for a sample."""
+        orig_idx = self.valid_indices[idx]
+        return self.call_data_list[orig_idx].filename
+
+    def get_sample_info(self, idx: int) -> dict:
+        """Get detailed info about a sample."""
+        orig_idx = self.valid_indices[idx]
+        cd = self.call_data_list[orig_idx]
+        return {
+            "filename": cd.filename,
+            "n_calls": cd.n_calls,
+            "label": int(self.processed_labels[idx]),
+            "label_name": LABEL_NAMES.get(int(self.processed_labels[idx]), "unknown"),
+        }
+
+    @property
+    def class_counts(self) -> dict:
+        """Count samples per class."""
+        unique, counts = np.unique(self.processed_labels, return_counts=True)
+        return dict(zip(unique.astype(int), counts))
+
+    @property
+    def class_weights(self) -> torch.Tensor:
+        """Compute class weights for imbalanced data (for CrossEntropyLoss)."""
+        counts = self.class_counts
+        total = sum(counts.values())
+        n_classes = len(counts)
+        weights = [total / (n_classes * counts.get(i, 1)) for i in range(n_classes)]
+        return torch.tensor(weights, dtype=torch.float32)
+
+    @property
+    def input_dim(self) -> int:
+        """Return the input dimension (pooler output dimension)."""
+        return self.pooler.output_dim
+
+
 def create_data_splits(
-    dataset: USVDataset,
+    dataset: Union[USVDataset, EnrichedUSVDataset],
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
@@ -229,7 +456,7 @@ def create_data_splits(
     Create train/val/test splits.
 
     Args:
-        dataset: USVDataset instance.
+        dataset: USVDataset or EnrichedUSVDataset instance.
         train_ratio: Fraction for training.
         val_ratio: Fraction for validation.
         test_ratio: Fraction for test.
