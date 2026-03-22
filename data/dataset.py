@@ -293,7 +293,7 @@ class EnrichedUSVDataset(Dataset):
             feature_std: Pre-computed std for normalization (for val/test sets).
             transform: Optional transform to apply to features.
         """
-        from ..pooling import PoolerRegistry
+        from pooling import PoolerRegistry
 
         self.csv_directory = Path(csv_directory)
         self.n_classes = n_classes
