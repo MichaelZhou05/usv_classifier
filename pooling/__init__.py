@@ -8,6 +8,7 @@ Available poolers:
     - average: Simple mean pooling (default)
     - max: Max pooling
     - statistics: Multi-statistic pooling (mean, std, min, max, median)
+    - swe: Sliced-Wasserstein Embedding (optimal transport-based)
 
 Usage:
     from usv_classifier.pooling import PoolerRegistry, AveragePooler
@@ -26,10 +27,22 @@ from .base import CallPooler
 from .registry import PoolerRegistry
 from .average import AveragePooler, MaxPooler, StatisticsPooler
 
+# Register SWE pooler (requires torch)
+try:
+    from .swe import SWEPooler, SWE_Pooling
+    PoolerRegistry.register_external("swe", SWEPooler)
+    _HAS_SWE = True
+except ImportError:
+    _HAS_SWE = False
+    SWEPooler = None
+    SWE_Pooling = None
+
 __all__ = [
     "CallPooler",
     "PoolerRegistry",
     "AveragePooler",
     "MaxPooler",
     "StatisticsPooler",
+    "SWEPooler",
+    "SWE_Pooling",
 ]
