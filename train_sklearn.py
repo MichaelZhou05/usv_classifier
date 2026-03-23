@@ -23,28 +23,38 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
 
 
-LABEL_NAMES = ['twitcher', 'wildtype', 'heterozygous']
+LABEL_NAMES_3CLASS = ['twitcher', 'wildtype', 'heterozygous']
+LABEL_NAMES_BINARY = ['twitcher', 'healthy']
 
 
-def infer_label(filename: str) -> int:
-    """Infer class label from filename."""
+def infer_label(filename: str, binary: bool = False) -> int:
+    """Infer class label from filename.
+
+    Args:
+        filename: Filename to parse
+        binary: If True, return 0=twitcher (disease), 1=healthy (wildtype+het)
+
+    Returns:
+        Class label
+    """
     fname = filename.lower()
     if 'twitcher' in fname or 'twi' in fname:
-        return 0
+        return 0  # Disease
     elif 'wildtype' in fname or ' wt ' in fname or '_wt_' in fname:
-        return 1
+        return 1 if binary else 1  # Healthy (binary) or wildtype (3-class)
     elif 'het' in fname:
-        return 2
+        return 1 if binary else 2  # Healthy (binary) or heterozygous (3-class)
     else:
         raise ValueError(f"Cannot infer label from: {filename}")
 
 
-def load_data(csv_dir: str, pooling: str = 'statistics'):
+def load_data(csv_dir: str, pooling: str = 'statistics', binary: bool = False):
     """Load and pool features from CSV files.
 
     Args:
         csv_dir: Directory containing enriched feature CSVs.
         pooling: Pooling strategy ('statistics', 'average', 'full').
+        binary: If True, use binary labels (disease vs healthy).
 
     Returns:
         X: Feature matrix (n_samples, n_features)
@@ -100,7 +110,7 @@ def load_data(csv_dir: str, pooling: str = 'statistics'):
         pooled = np.nan_to_num(pooled, nan=0.0, posinf=0.0, neginf=0.0)
 
         try:
-            label = infer_label(Path(f).stem)
+            label = infer_label(Path(f).stem, binary=binary)
             X_list.append(pooled)
             y_list.append(label)
             names.append(Path(f).stem)
@@ -114,7 +124,7 @@ def load_data(csv_dir: str, pooling: str = 'statistics'):
     return X, y, names
 
 
-def evaluate_models(X, y, cv_folds: int = 5):
+def evaluate_models(X, y, cv_folds: int = 5, binary: bool = False):
     """Evaluate multiple models using cross-validation.
 
     Args:
@@ -167,6 +177,7 @@ def evaluate_models(X, y, cv_folds: int = 5):
     # Cross-validation
     cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
 
+    label_names = LABEL_NAMES_BINARY if binary else LABEL_NAMES_3CLASS
     results = {}
 
     for name, model in models.items():
@@ -175,7 +186,7 @@ def evaluate_models(X, y, cv_folds: int = 5):
         acc = accuracy_score(y, y_pred)
         macro_f1 = f1_score(y, y_pred, average='macro')
         cm = confusion_matrix(y, y_pred)
-        report = classification_report(y, y_pred, target_names=LABEL_NAMES, zero_division=0)
+        report = classification_report(y, y_pred, target_names=label_names, zero_division=0)
 
         results[name] = {
             'accuracy': acc,
@@ -223,21 +234,25 @@ def main():
                         help='Pooling strategy for call features')
     parser.add_argument('--cv-folds', type=int, default=5,
                         help='Number of cross-validation folds')
+    parser.add_argument('--binary', action='store_true',
+                        help='Use binary classification (disease vs healthy)')
     args = parser.parse_args()
 
     print(f"Loading data from: {args.csv_dir}")
     print(f"Pooling strategy: {args.pooling}")
+    print(f"Classification: {'binary (disease vs healthy)' if args.binary else '3-class'}")
 
     # Load data
-    X, y, names = load_data(args.csv_dir, pooling=args.pooling)
+    X, y, names = load_data(args.csv_dir, pooling=args.pooling, binary=args.binary)
 
+    label_names = LABEL_NAMES_BINARY if args.binary else LABEL_NAMES_3CLASS
     print(f"\nDataset: {X.shape[0]} samples, {X.shape[1]} features")
     print(f"Class distribution:")
-    for i, name in enumerate(LABEL_NAMES):
+    for i, name in enumerate(label_names):
         print(f"  {name}: {sum(y == i)}")
 
     # Evaluate models
-    results, scaler = evaluate_models(X, y, cv_folds=args.cv_folds)
+    results, scaler = evaluate_models(X, y, cv_folds=args.cv_folds, binary=args.binary)
 
     # Print results
     print_results(results)
