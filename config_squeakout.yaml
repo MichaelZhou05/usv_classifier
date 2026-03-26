@@ -1,0 +1,86 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# USV Classifier — SqueakOut latent-feature pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+# Uses the SqueakOut encoder's deep representations (1280-dim per call) instead
+# of hand-crafted summary statistics (duration, freq, slope, etc.).
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+data_directory: "../data/usv_recordings"    # contains *.wav + *.csv pairs
+squeakout_weights: "../squeakout/squeakout_weights.ckpt"
+output_directory: "./outputs"
+
+# ── SqueakOut encoder ─────────────────────────────────────────────────────────
+encoder:
+  # Which depth to extract from the MobileNetV2 backbone:
+  #   'deep'  → 1280-dim  (default; highest information, most parameters)
+  #   'x4'    →   96-dim  (good for very small datasets, less overfitting)
+  #   'x3'    →   32-dim  (lightest; comparable to current 11 hand-crafted feats)
+  #   'multi' → 1408-dim  (multi-scale, richest but largest input to classifier)
+  extraction_point: "deep"
+  device: "cpu"                # set to "cuda" or "mps" if available
+  batch_size: 16               # spectrograms per forward pass
+
+# ── Spectrogram generation ────────────────────────────────────────────────────
+spectrogram:
+  # Fixed time window per call. All calls shorter than this are zero-padded;
+  # calls longer are centre-cropped. 300ms covers virtually all mouse USV calls.
+  window_duration_sec: 0.30
+  freq_min: 30000              # Hz — lower bound of USV frequency crop
+  freq_max: 130000             # Hz — upper bound
+  n_fft: 512
+  hop_length: 64
+
+# ── Pooling ───────────────────────────────────────────────────────────────────
+# Aggregates the per-call feature vectors into one vector per recording.
+# Primary options: "swe" (best, learns optimal transport embedding)
+#                  "average" (fast baseline, good for tiny datasets)
+pooler: "swe"
+
+# SWE-specific settings (only used when pooler = "swe")
+swe:
+  # n_features is set automatically to encoder.output_dim at runtime
+  num_slices: 16               # number of random projection directions
+  num_ref_points: 10           # resolution of the CDF approximation
+  freeze_swe: false            # true = fixed random projections (faster)
+  flatten: true                # output dim = num_slices * num_ref_points
+
+# ── Class-balance augmentation ────────────────────────────────────────────────
+augmentation:
+  enabled: true
+  # Noise level as fraction of each class' per-feature standard deviation.
+  # 0.05 = 5% noise — small enough to preserve call identity, large enough
+  # to diversify the synthetic samples.
+  noise_std: 0.05
+  random_seed: 42
+  # NOTE: augmentation is applied only to the training split.
+  # Val and test sets always use real data only.
+
+# ── Classification model ──────────────────────────────────────────────────────
+n_classes: 3                   # twitcher=0, wildtype=1, het=2
+
+model:
+  # Input dim is computed at runtime as pooler.output_dim
+  # swe default: 16 slices × 10 ref points = 160-dim
+  # average:     encoder.output_dim = 1280-dim
+  hidden_dims: [256, 128, 64]  # larger than before because features are richer
+  dropout: 0.5
+  use_batch_norm: true
+  use_class_weights: true      # re-weight loss by inverse class frequency
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  n_epochs: 300
+  batch_size: 8
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  early_stopping_patience: 40
+
+# ── Data splits ───────────────────────────────────────────────────────────────
+splits:
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  random_seed: 42
+  stratify: true
+
+normalize_features: true

@@ -1,44 +1,24 @@
-"""Data loading and preprocessing modules."""
+"""Data loading and feature extraction for USV classification."""
 
-from .mat_parser import load_deepsqueak_mat, load_all_mat_files, CallData
-from .enriched_parser import (
-    load_enriched_csv,
-    load_all_enriched_csv,
-    EnrichedCallData,
-    get_recording_name,
-    FEATURE_COLUMNS,
-    N_FEATURES,
+from .dataset import LABEL_MAP, LABEL_NAMES, infer_label_from_filename, stratified_split
+from .squeakout_features import (
+    generate_call_spectrogram,
+    SqueakOutEncoder,
+    extract_recording_features,
+    augment_to_balance,
+    build_squeakout_dataset,
 )
-from .dataset import (
-    USVDataset,
-    EnrichedUSVDataset,
-    create_data_splits,
-    infer_label_from_filename,
-    LABEL_MAP,
-    LABEL_NAMES,
-)
-from .preprocessing import normalize_features, pad_or_truncate
 
 __all__ = [
-    # MAT parser
-    "load_deepsqueak_mat",
-    "load_all_mat_files",
-    "CallData",
-    # Enriched parser
-    "load_enriched_csv",
-    "load_all_enriched_csv",
-    "EnrichedCallData",
-    "get_recording_name",
-    "FEATURE_COLUMNS",
-    "N_FEATURES",
-    # Datasets
-    "USVDataset",
-    "EnrichedUSVDataset",
-    "create_data_splits",
-    "infer_label_from_filename",
+    # Label utilities
     "LABEL_MAP",
     "LABEL_NAMES",
-    # Preprocessing
-    "normalize_features",
-    "pad_or_truncate",
+    "infer_label_from_filename",
+    "stratified_split",
+    # SqueakOut feature extraction
+    "generate_call_spectrogram",
+    "SqueakOutEncoder",
+    "extract_recording_features",
+    "augment_to_balance",
+    "build_squeakout_dataset",
 ]
