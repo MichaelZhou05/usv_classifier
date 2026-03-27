@@ -224,7 +224,8 @@ def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int,
         torch.tensor(X, dtype=torch.float32),
         torch.tensor(y, dtype=torch.long),
     )
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
+                      drop_last=shuffle)  # drop last batch when training to avoid size-1 batches with BatchNorm
 
 
 def train_epoch(model, loader, criterion, optimizer, device):
