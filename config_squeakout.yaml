@@ -16,7 +16,7 @@ encoder:
   #   'x4'    →   96-dim  (good for very small datasets, less overfitting)
   #   'x3'    →   32-dim  (lightest; comparable to current 11 hand-crafted feats)
   #   'multi' → 1408-dim  (multi-scale, richest but largest input to classifier)
-  extraction_point: "deep"
+  extraction_point: "x4"
   device: "cpu"                # set to "cuda" or "mps" if available
   batch_size: 16               # spectrograms per forward pass
 
@@ -34,7 +34,7 @@ spectrogram:
 # Aggregates the per-call feature vectors into one vector per recording.
 # Primary options: "swe" (best, learns optimal transport embedding)
 #                  "average" (fast baseline, good for tiny datasets)
-pooler: "swe"
+pooler: "average"
 
 # SWE-specific settings (only used when pooler = "swe")
 swe:
