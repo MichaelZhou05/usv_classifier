@@ -52,7 +52,14 @@ _SQUEAKOUT_DIR = Path(__file__).parent.parent / "squeakout"
 if str(_SQUEAKOUT_DIR) not in sys.path:
     sys.path.insert(0, str(_SQUEAKOUT_DIR))
 
-from squeakout import SqueakOut_autoencoder  # noqa: E402
+# squeakout.py imports pytorch_lightning at the top level only for the
+# SqueakOut_autoencoder Lightning wrapper, which we never use here.
+# Mock it out so pytorch_lightning does not need to be installed.
+if 'pytorch_lightning' not in sys.modules:
+    from unittest.mock import MagicMock
+    sys.modules['pytorch_lightning'] = MagicMock()
+
+from squeakout import SqueakOut  # noqa: E402 — bare nn.Module, no Lightning
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,10 +187,17 @@ def make_spectrogram_image(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_squeakout(weights_path: str, device: str = 'cpu') -> torch.nn.Module:
-    """Load pretrained SqueakOut model in eval mode."""
-    model = SqueakOut_autoencoder()
+    """Load pretrained SqueakOut model in eval mode.
+
+    The checkpoint was saved by pytorch_lightning as SqueakOut_autoencoder,
+    where self.model = SqueakOut(). State dict keys are therefore prefixed
+    with 'model.' — strip that prefix to load directly into SqueakOut.
+    """
+    model = SqueakOut()
     ckpt = torch.load(weights_path, map_location=device)
-    model.load_state_dict(ckpt['state_dict'])
+    # Strip 'model.' prefix from Lightning checkpoint keys
+    state = {k.removeprefix('model.'): v for k, v in ckpt['state_dict'].items()}
+    model.load_state_dict(state)
     model.eval()
     model.to(device)
     return model

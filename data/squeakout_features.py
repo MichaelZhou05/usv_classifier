@@ -51,7 +51,14 @@ _SQUEAKOUT_DIR = Path(__file__).parent.parent.parent / "squeakout"
 if str(_SQUEAKOUT_DIR) not in sys.path:
     sys.path.insert(0, str(_SQUEAKOUT_DIR))
 
-from squeakout import SqueakOut_autoencoder  # noqa: E402
+# squeakout.py imports pytorch_lightning at the top level only for the
+# SqueakOut_autoencoder Lightning wrapper, which we never use here.
+# Mock it out so pytorch_lightning does not need to be installed.
+if 'pytorch_lightning' not in sys.modules:
+    from unittest.mock import MagicMock
+    sys.modules['pytorch_lightning'] = MagicMock()
+
+from squeakout import SqueakOut  # noqa: E402 — bare nn.Module, no Lightning
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -190,11 +197,15 @@ class SqueakOutEncoder(nn.Module):
         self.extraction_point = extraction_point
         self.device = torch.device(device)
 
-        wrapper = SqueakOut_autoencoder()
+        # Load directly into SqueakOut (bare nn.Module) — no Lightning needed.
+        # Checkpoint was saved by SqueakOut_autoencoder (self.model = SqueakOut()),
+        # so state dict keys are prefixed with 'model.'; strip that prefix.
+        squeakout = SqueakOut()
         ckpt = torch.load(weights_path, map_location=device)
-        wrapper.load_state_dict(ckpt['state_dict'])
+        state = {k.removeprefix('model.'): v for k, v in ckpt['state_dict'].items()}
+        squeakout.load_state_dict(state)
 
-        self.backbone = wrapper.model.backbone
+        self.backbone = squeakout.backbone
         self.backbone.eval()
         for p in self.backbone.parameters():
             p.requires_grad = False
