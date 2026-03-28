@@ -60,19 +60,18 @@ n_classes: 3                   # twitcher=0, wildtype=1, het=2
 
 model:
   # Input dim is computed at runtime as pooler.output_dim
-  # swe default: 16 slices × 10 ref points = 160-dim
-  # average:     encoder.output_dim = 1280-dim
-  hidden_dims: [256, 128, 64]  # larger than before because features are richer
-  dropout: 0.5
-  use_batch_norm: true
+  # average + x4: 96-dim input
+  hidden_dims: [64]            # tiny: 56 training samples can't support more
+  dropout: 0.2
+  use_batch_norm: false        # BatchNorm unstable on tiny datasets
   use_class_weights: true      # re-weight loss by inverse class frequency
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
   n_epochs: 300
   batch_size: 8
-  learning_rate: 0.0001
-  weight_decay: 0.01
+  learning_rate: 0.001
+  weight_decay: 0.0001
   early_stopping_patience: 40
 
 # ── Data splits ───────────────────────────────────────────────────────────────

@@ -476,6 +476,22 @@ def train(config: dict, data_dir: str, detections_dir: str,
     print("-" * 65)
     print(f"Best epoch: {best_ep}  val_loss: {best_loss:.4f}")
 
+    # ── 11b. SVM baseline (fast sanity check on feature quality) ─────────────
+    from sklearn.svm import SVC
+    from sklearn.metrics import f1_score as sk_f1
+    svm = SVC(kernel='rbf', class_weight='balanced', C=1.0, gamma='scale')
+    svm.fit(X_train, y_train)
+    svm_preds = svm.predict(X_test)
+    svm_f1 = sk_f1(y_test, svm_preds, average='macro', zero_division=0)
+    print(f"\nSVM baseline (rbf, C=1):  macro F1 = {svm_f1:.3f}")
+    from sklearn.ensemble import RandomForestClassifier
+    rf = RandomForestClassifier(n_estimators=200, class_weight='balanced', random_state=seed)
+    rf.fit(X_train, y_train)
+    rf_preds = rf.predict(X_test)
+    rf_f1 = sk_f1(y_test, rf_preds, average='macro', zero_division=0)
+    print(f"Random forest (200 trees): macro F1 = {rf_f1:.3f}")
+    print()
+
     # ── 12. Final evaluation on test set ──────────────────────────────────────
     ckpt = torch.load(run_dir / "best_model.pt", weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
