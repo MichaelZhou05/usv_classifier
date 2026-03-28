@@ -54,6 +54,7 @@ python train.py \
     --config        config_squeakout.yaml \
     --data_dir      "$AUDIO_DIR" \
     --detections_dir "$DETECTIONS_DIR" \
-    --cache_dir     "$CACHE_DIR"
+    --cache_dir     "$CACHE_DIR" \
+    --cv_folds      5
 
 echo "Training complete."

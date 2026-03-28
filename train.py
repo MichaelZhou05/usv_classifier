@@ -43,7 +43,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, f1_score as sk_f1
+from sklearn.model_selection import StratifiedKFold
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
 import yaml
 
 from data import (
@@ -476,22 +479,6 @@ def train(config: dict, data_dir: str, detections_dir: str,
     print("-" * 65)
     print(f"Best epoch: {best_ep}  val_loss: {best_loss:.4f}")
 
-    # ── 11b. SVM baseline (fast sanity check on feature quality) ─────────────
-    from sklearn.svm import SVC
-    from sklearn.metrics import f1_score as sk_f1
-    svm = SVC(kernel='rbf', class_weight='balanced', C=1.0, gamma='scale')
-    svm.fit(X_train, y_train)
-    svm_preds = svm.predict(X_test)
-    svm_f1 = sk_f1(y_test, svm_preds, average='macro', zero_division=0)
-    print(f"\nSVM baseline (rbf, C=1):  macro F1 = {svm_f1:.3f}")
-    from sklearn.ensemble import RandomForestClassifier
-    rf = RandomForestClassifier(n_estimators=200, class_weight='balanced', random_state=seed)
-    rf.fit(X_train, y_train)
-    rf_preds = rf.predict(X_test)
-    rf_f1 = sk_f1(y_test, rf_preds, average='macro', zero_division=0)
-    print(f"Random forest (200 trees): macro F1 = {rf_f1:.3f}")
-    print()
-
     # ── 12. Final evaluation on test set ──────────────────────────────────────
     ckpt = torch.load(run_dir / "best_model.pt", weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -527,6 +514,153 @@ def train(config: dict, data_dir: str, detections_dir: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Cross-validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cross_validate(config: dict, data_dir: str, detections_dir: str,
+                   cache_dir: str | None = None, n_folds: int = 5):
+    """
+    Stratified k-fold cross-validation over all recordings.
+
+    Each recording appears in the test set exactly once, giving reliable metrics
+    on small datasets where a fixed 70/15/15 split produces noisy results.
+    Features are loaded from cache (fast); only pooling + classifier training
+    runs per fold.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed    = config.get("seed", 42)
+    n_classes = config.get("n_classes", 3)
+    cfg_enc  = config["encoder"]
+    cfg_spec = config["spectrogram"]
+    cfg_aug  = config.get("augmentation", {})
+    cfg_tr   = config.get("training", {})
+    cfg_model = config.get("model", {})
+
+    wav_paths, csv_paths, labels = find_recordings(data_dir, detections_dir, n_classes)
+    print(f"\nCross-validation: {n_folds} folds over {len(wav_paths)} recordings")
+    for lbl in np.unique(labels):
+        print(f"  {LABEL_NAMES.get(lbl, lbl)}: {(labels == lbl).sum()}")
+
+    weights_path = config.get("squeakout_weights", "../squeakout/squeakout_weights.ckpt")
+    encoder = SqueakOutEncoder(
+        weights_path=weights_path,
+        extraction_point=cfg_enc["extraction_point"],
+        device=cfg_enc.get("device", "cpu"),
+    )
+    pooler_name   = config.get("pooler", "average")
+    pooler_kwargs = {"n_features": encoder.output_dim}
+
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    all_true = np.array(labels, dtype=np.int64)
+    preds_svm = np.full(len(labels), -1, dtype=np.int64)
+    preds_rf  = np.full(len(labels), -1, dtype=np.int64)
+    preds_mlp = np.full(len(labels), -1, dtype=np.int64)
+
+    for fold, (tr_idx, te_idx) in enumerate(skf.split(range(len(labels)), all_true)):
+        print(f"\n── Fold {fold + 1}/{n_folds} "
+              f"(train={len(tr_idx)}, test={len(te_idx)}) ──")
+
+        pooler = PoolerRegistry.get(pooler_name, **pooler_kwargs)
+
+        # Use last ~15% of train fold as val for MLP early stopping
+        n_val = max(1, int(0.15 * len(tr_idx)))
+        inner_tr = list(tr_idx[:-n_val])
+        inner_val = list(tr_idx[-n_val:])
+
+        def _feat(idx_list, augment=False):
+            w = [wav_paths[i] for i in idx_list]
+            c = [csv_paths[i] for i in idx_list]
+            l = all_true[idx_list]
+            meta, _ = extract_split_features(
+                w, c, l, encoder,
+                cache_dir=Path(cache_dir) if cache_dir else None,
+                cfg_enc=cfg_enc, cfg_spec=cfg_spec,
+                augment=augment,
+                noise_std=cfg_aug.get("noise_std", 0.05),
+                random_seed=seed,
+            )
+            return pool_recordings(meta, pooler)
+
+        X_tr,  y_tr  = _feat(inner_tr,  augment=cfg_aug.get("enabled", True))
+        X_val, y_val = _feat(inner_val, augment=False)
+        X_te,  y_te  = _feat(list(te_idx), augment=False)
+
+        mean = X_tr.mean(0)
+        std  = np.maximum(X_tr.std(0), 1e-8)
+        X_tr  = (X_tr  - mean) / std
+        X_val = (X_val - mean) / std
+        X_te  = (X_te  - mean) / std
+
+        # Combine train+val for sklearn (no need to hold out val)
+        X_sk = np.vstack([X_tr, X_val])
+        y_sk = np.concatenate([y_tr, y_val])
+
+        svm = SVC(kernel='rbf', class_weight='balanced', C=1.0, gamma='scale')
+        svm.fit(X_sk, y_sk)
+        preds_svm[te_idx[:len(y_te)]] = svm.predict(X_te)
+
+        rf = RandomForestClassifier(n_estimators=200, class_weight='balanced',
+                                    random_state=seed)
+        rf.fit(X_sk, y_sk)
+        preds_rf[te_idx[:len(y_te)]] = rf.predict(X_te)
+
+        # MLP per fold
+        counts  = np.bincount(y_tr, minlength=n_classes).astype(float)
+        weights = len(y_tr) / (n_classes * np.maximum(counts, 1))
+        crit    = nn.CrossEntropyLoss(
+            weight=torch.tensor(weights, dtype=torch.float32).to(device)
+        )
+        model = get_model(
+            "enriched", input_dim=X_tr.shape[1], n_classes=n_classes,
+            hidden_dims=cfg_model.get("hidden_dims", [64]),
+            dropout=cfg_model.get("dropout", 0.2),
+            use_batch_norm=False,
+        ).to(device)
+        opt = torch.optim.Adam(model.parameters(),
+                               lr=cfg_tr.get("learning_rate", 1e-3),
+                               weight_decay=cfg_tr.get("weight_decay", 1e-4))
+        tr_loader  = make_loader(X_tr,  y_tr,  cfg_tr.get("batch_size", 8), shuffle=True)
+        val_loader = make_loader(X_val, y_val, cfg_tr.get("batch_size", 8), shuffle=False)
+
+        best_loss, stall, best_state = float("inf"), 0, None
+        patience = cfg_tr.get("early_stopping_patience", 40)
+        for ep in range(1, cfg_tr.get("n_epochs", 300) + 1):
+            train_epoch(model, tr_loader, crit, opt, device)
+            vm = evaluate(model, val_loader, crit, device, n_classes)
+            if vm["loss"] < best_loss:
+                best_loss = vm["loss"]
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                stall = 0
+            else:
+                stall += 1
+                if stall >= patience:
+                    break
+        if best_state:
+            model.load_state_dict(best_state)
+        te_loader = make_loader(X_te, y_te, cfg_tr.get("batch_size", 8), shuffle=False)
+        tm = evaluate(model, te_loader, crit, device, n_classes)
+        preds_mlp[te_idx[:len(y_te)]] = tm["preds"]
+
+    # ── Aggregate results ─────────────────────────────────────────────────────
+    target_names = [LABEL_NAMES.get(i, f"class_{i}") for i in range(n_classes)]
+    valid = all_true[preds_svm != -1]  # guard against any skipped folds
+
+    print(f"\n{'='*65}")
+    print(f"Cross-validation results ({n_folds} folds, {len(labels)} recordings)")
+    print(f"{'='*65}")
+    for name, preds in [("SVM (rbf)", preds_svm), ("Random Forest", preds_rf), ("MLP", preds_mlp)]:
+        mask = preds != -1
+        t, p = all_true[mask], preds[mask]
+        macro = sk_f1(t, p, average='macro', zero_division=0)
+        acc   = (t == p).mean()
+        print(f"\n{name}  —  accuracy={acc:.3f}  macro_F1={macro:.3f}")
+        print(classification_report(t, p, target_names=target_names, zero_division=0))
+        print("Confusion matrix (rows=true, cols=pred):")
+        print(confusion_matrix(t, p))
+    print(f"{'='*65}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -545,12 +679,20 @@ def main():
                         help="Directory to cache per-recording encoder features. "
                              "Highly recommended on the cluster: extracts once, "
                              "reuses for every subsequent training run.")
+    parser.add_argument("--cv_folds", type=int, default=0,
+                        help="Run k-fold cross-validation instead of a fixed split. "
+                             "Recommended for small datasets (e.g. --cv_folds 5). "
+                             "0 = use fixed train/val/test split (default).")
     args = parser.parse_args()
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    train(config, args.data_dir, args.detections_dir, args.cache_dir)
+    if args.cv_folds > 1:
+        cross_validate(config, args.data_dir, args.detections_dir,
+                       args.cache_dir, n_folds=args.cv_folds)
+    else:
+        train(config, args.data_dir, args.detections_dir, args.cache_dir)
 
 
 if __name__ == "__main__":
