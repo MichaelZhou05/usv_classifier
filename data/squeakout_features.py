@@ -359,6 +359,87 @@ def extract_recording_features(
 # 4. Class-balance augmentation in feature space
 # ──────────────────────────────────────────────────────────────────────────────
 
+def augment_recordings_to_balance(
+    recording_meta: list[tuple[int, list[np.ndarray]]],
+    noise_std: float = 0.05,
+    target_count: Optional[int] = None,
+    random_seed: int = 42,
+) -> list[tuple[int, list[np.ndarray]]]:
+    """
+    Balance class representation by synthesising new virtual recordings for
+    minority classes.
+
+    Augmentation is done at the **recording** level (before pooling).  For
+    each minority-class recording we need to add, we randomly sample one
+    existing real recording from that class and apply per-feature Gaussian
+    noise to every call vector it contains.  The result is a new virtual
+    recording whose pooled representation will differ slightly from the
+    original, giving the classifier diverse training examples.
+
+    After this function all classes have the same number of recordings, so
+    after pooling each class contributes an equal number of vectors.
+
+    Args:
+        recording_meta:  List of (label, call_features) tuples — one entry
+                         per recording.  call_features is a list of
+                         (output_dim,) float32 arrays.
+        noise_std:       Noise amplitude as a fraction of each call's
+                         per-feature standard deviation across all calls of
+                         that class.  0.05 (5%) perturbs gently while
+                         preserving call-level structure.
+        target_count:    Desired number of recordings per class.  Defaults to
+                         the count of the majority class.
+        random_seed:     For reproducibility.
+
+    Returns:
+        Extended recording_meta list.  Original entries are unchanged;
+        synthetic entries are appended at the end.
+
+    Example
+    ───────
+    twitcher has 3 recordings, wildtype has 9.
+    After augment_recordings_to_balance(), twitcher has 9 recordings (3 real
+    + 6 synthetic), wildtype still has 9.  Each pooler.pool() call then yields
+    one vector, giving 9 vectors per class for training.
+    """
+    rng = np.random.default_rng(random_seed)
+
+    # Group existing recordings by class label
+    class_recordings: dict[int, list[list[np.ndarray]]] = {}
+    for label, calls in recording_meta:
+        class_recordings.setdefault(label, []).append(calls)
+
+    if target_count is None:
+        target_count = max(len(recs) for recs in class_recordings.values())
+
+    # Pre-compute per-feature std from all calls of each class (for noise scale)
+    class_feat_std: dict[int, np.ndarray] = {}
+    for label, recs in class_recordings.items():
+        all_calls = np.concatenate([np.stack(c) for c in recs], axis=0)
+        class_feat_std[label] = np.maximum(all_calls.std(axis=0), 1e-8)
+
+    augmented_meta: list[tuple[int, list[np.ndarray]]] = list(recording_meta)
+
+    for label, recs in class_recordings.items():
+        n_real = len(recs)
+        if n_real >= target_count:
+            continue
+
+        n_to_add = target_count - n_real
+        feat_std = class_feat_std[label]
+
+        for _ in range(n_to_add):
+            # Pick a random real recording to clone
+            src_calls = recs[rng.integers(0, n_real)]
+            calls_array = np.stack(src_calls)               # (n_calls, d)
+            noise = rng.normal(0.0, noise_std, size=calls_array.shape)
+            noise *= feat_std[np.newaxis, :]
+            synthetic_calls = list(calls_array + noise)
+            augmented_meta.append((label, synthetic_calls))
+
+    return augmented_meta
+
+
 def augment_to_balance(
     class_call_features: dict[int, list[np.ndarray]],
     noise_std: float = 0.05,
@@ -369,33 +450,21 @@ def augment_to_balance(
     Balance class representation by augmenting minority-class call vectors
     with additive Gaussian noise.
 
-    Augmentation is done at the **individual call** level (before pooling),
-    not at the recording level. This means the pooler (SWE or average) will
-    see a full, balanced set of calls per class, producing diverse
-    recording-level embeddings rather than simple duplicates.
+    .. deprecated::
+        Prefer :func:`augment_recordings_to_balance`, which works at the
+        recording level and guarantees equal pooled-vector counts per class.
+        This function operates at the individual-call level and lumps all
+        synthetic calls into a single virtual recording per class.
 
     Args:
         class_call_features: Dict mapping class_label (int) → list of
                              (output_dim,) feature arrays, one per call.
-                             Collect all calls across all recordings of each
-                             class.
-        noise_std:           Noise amplitude as a fraction of each class'
-                             per-feature standard deviation. 0.05 (5%) gives
-                             mild perturbation that preserves the original
-                             distribution while adding variety.
-        target_count:        Augment each class to this many calls total.
-                             Defaults to the count of the majority class.
+        noise_std:           Noise fraction of per-feature std.
+        target_count:        Target call count per class (default: majority).
         random_seed:         For reproducibility.
 
     Returns:
-        Augmented dict with the same structure. Minority classes have
-        synthetic calls appended after the real ones.
-
-    Example
-    ───────
-    Suppose twitcher has 200 calls and wildtype has 600 calls.
-    After augment_to_balance(), twitcher will also have 600 calls, of which
-    400 are augmented copies of the original 200 with small Gaussian noise.
+        Augmented dict with synthetic calls appended for minority classes.
     """
     rng = np.random.default_rng(random_seed)
     if target_count is None:
@@ -499,10 +568,7 @@ def build_squeakout_dataset(
         raise FileNotFoundError(f"No .wav files found in {data_dir}")
 
     # ── Step 1: extract per-call features for each recording ─────────────────
-    # class_calls[label] = [call_vec, call_vec, ...] across all recordings
-    class_calls: dict[int, list[np.ndarray]] = {}
-    # recording_meta keeps (label, list_of_call_feature_arrays) per recording
-    # so we can reconstruct per-recording data after augmentation
+    # recording_meta: one entry per recording — (label, [call_vec, ...])
     recording_meta: list[tuple[int, list[np.ndarray]]] = []
 
     for wav_path in wav_files:
@@ -530,27 +596,19 @@ def build_squeakout_dataset(
             continue
 
         recording_meta.append((label, list(call_feats)))
-        class_calls.setdefault(label, []).extend(list(call_feats))
 
     if not recording_meta:
         raise ValueError("No valid recordings found after filtering.")
 
     # ── Step 2: augment minority classes (training split only) ───────────────
+    # Augmentation is done at the recording level: for each missing recording
+    # in a minority class we clone a real recording and add per-call Gaussian
+    # noise.  After pooling, every class contributes the same number of
+    # pooled vectors to the training set.
     if augment:
-        class_calls = augment_to_balance(
-            class_calls, noise_std=noise_std, random_seed=random_seed
+        recording_meta = augment_recordings_to_balance(
+            recording_meta, noise_std=noise_std, random_seed=random_seed
         )
-        # Redistribute augmented calls back across recordings proportionally.
-        # Each existing recording keeps its real calls; synthetic calls are
-        # grouped into virtual extra recordings (one per minority-class label).
-        augmented_meta: list[tuple[int, list[np.ndarray]]] = list(recording_meta)
-        for label, all_calls in class_calls.items():
-            n_real = sum(len(c) for lbl, c in recording_meta if lbl == label)
-            synthetic = all_calls[n_real:]
-            if synthetic:
-                # Add synthetic calls as a single virtual recording per class
-                augmented_meta.append((label, synthetic))
-        recording_meta = augmented_meta
 
     # ── Step 3: pool each recording → one vector per recording ───────────────
     features_list = []
