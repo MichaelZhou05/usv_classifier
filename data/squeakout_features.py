@@ -492,6 +492,79 @@ def augment_to_balance(
     return augmented
 
 
+def augment_by_cross_litter_mixing(
+    recording_meta: list[tuple[int, list[np.ndarray]]],
+    target_count: Optional[int] = None,
+    target_multiplier: float = 1.0,
+    n_sources: int = 2,
+    random_seed: int = 42,
+) -> list[tuple[int, list[np.ndarray]]]:
+    """
+    Create synthetic recordings by mixing calls from different real recordings
+    of the same class.
+
+    Unlike noise-based augmentation (which clones a single recording with
+    jitter), cross-litter mixing draws calls from *n_sources distinct
+    recordings*, producing a virtual recording whose pooled representation
+    blends acoustic patterns from multiple litters.  This discourages the
+    classifier from memorising litter-specific recording conditions.
+
+    For each synthetic recording to create:
+      1. Sample n_sources real recordings (with replacement when n_real < n_sources).
+      2. Draw a random 50–80 % subset of calls from each source.
+      3. Concatenate the subsets → one new virtual recording.
+
+    Args:
+        recording_meta:    List of (label, call_features) tuples.
+        target_count:      Desired number of recordings per class after
+                           augmentation.  Defaults to
+                           max_class_count * target_multiplier.
+        target_multiplier: Multiplier applied to the majority class count to
+                           set target_count (ignored when target_count is given).
+                           1.0 = balance classes; 2.0 = double the majority.
+        n_sources:         Number of real recordings to mix per synthetic.
+        random_seed:       For reproducibility.
+
+    Returns:
+        Extended recording_meta list.  Original entries are unchanged;
+        synthetic entries are appended at the end.
+    """
+    rng = np.random.default_rng(random_seed)
+
+    class_recordings: dict[int, list[list[np.ndarray]]] = {}
+    for label, calls in recording_meta:
+        class_recordings.setdefault(label, []).append(calls)
+
+    if target_count is None:
+        max_count = max(len(recs) for recs in class_recordings.values())
+        target_count = max(1, int(round(max_count * target_multiplier)))
+
+    augmented = list(recording_meta)
+
+    for label, recs in class_recordings.items():
+        n_real = len(recs)
+        if n_real >= target_count:
+            continue
+
+        n_to_add = target_count - n_real
+        # Sample with replacement when we have fewer recordings than sources
+        replace = n_real < n_sources
+
+        for _ in range(n_to_add):
+            src_indices = rng.choice(n_real, size=n_sources, replace=replace)
+            mixed_calls: list[np.ndarray] = []
+            for src_idx in src_indices:
+                src_calls = np.stack(recs[int(src_idx)])   # (n_calls, d)
+                # Take a random 50–80 % of the calls from this source
+                frac = rng.uniform(0.5, 0.8)
+                n_take = max(1, int(round(len(src_calls) * frac)))
+                chosen = rng.choice(len(src_calls), size=n_take, replace=False)
+                mixed_calls.extend(list(src_calls[chosen]))
+            augmented.append((label, mixed_calls))
+
+    return augmented
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 5. Dataset builder
 # ──────────────────────────────────────────────────────────────────────────────

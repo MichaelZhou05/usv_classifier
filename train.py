@@ -39,12 +39,33 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Progress logger — key milestones written to stdout AND run_dir/progress.log
+# so you can `cat progress.log` for a quick status check without reading the
+# full SLURM output log.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ProgressLogger:
+    def __init__(self, log_path: Path):
+        self.log_path = log_path
+
+    def log(self, msg: str):
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        entry = f"[{timestamp}] {msg}"
+        print(entry, flush=True)
+        with open(self.log_path, 'a') as f:
+            f.write(entry + '\n')
+
+import re
+
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import classification_report, confusion_matrix, f1_score as sk_f1
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 import yaml
@@ -52,7 +73,8 @@ import yaml
 from data import (
     SqueakOutEncoder,
     extract_recording_features,
-    augment_to_balance,
+    augment_recordings_to_balance,
+    augment_by_cross_litter_mixing,
     infer_label_from_filename,
     stratified_split,
     LABEL_NAMES,
@@ -81,12 +103,12 @@ def find_recordings(
         n_classes:      2 or 3.
 
     Returns:
-        (wav_paths, csv_paths, labels) — parallel lists of matching pairs.
+        (wav_paths, csv_paths, labels, litter_ids) — parallel lists of matching pairs.
     """
     data_path = Path(data_dir)
     det_path = Path(detections_dir)
 
-    wav_paths, csv_paths, labels = [], [], []
+    wav_paths, csv_paths, labels, litter_ids = [], [], [], []
     skipped = []
 
     for wav in sorted(data_path.glob("*.wav")):
@@ -102,13 +124,56 @@ def find_recordings(
         wav_paths.append(wav)
         csv_paths.append(csv)
         labels.append(label)
+        litter_ids.append(extract_litter_id(wav))
 
     if skipped:
         print(f"Skipped {len(skipped)} recordings:")
         for s in skipped:
             print(s)
 
-    return wav_paths, csv_paths, np.array(labels, dtype=np.int64)
+    return wav_paths, csv_paths, np.array(labels, dtype=np.int64), litter_ids
+
+
+def extract_litter_id(wav_path: Path) -> str:
+    """Extract litter number from filename.
+    e.g. '2025_07_04 48-3 P7 het.wav' → '48'. Falls back to full stem.
+    """
+    m = re.search(r'\s(\w+)-\d+\s', wav_path.stem)
+    return m.group(1) if m else wav_path.stem
+
+
+def compute_acoustic_stats(csv_path: Path) -> np.ndarray:
+    """
+    Compute 8 per-recording acoustic summary statistics from a detection CSV.
+
+    Features (in order):
+        call_count, call_rate_per_sec,
+        mean_duration, std_duration,
+        mean_freq_center, std_freq_center,
+        mean_freq_bandwidth, std_freq_bandwidth
+
+    Returns (8,) float32 array; all zeros if CSV has no calls.
+    """
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        return np.zeros(8, dtype=np.float32)
+
+    durations = (df['end_sec'] - df['start_sec']).values.astype(np.float32)
+    span = float(df['end_sec'].max())
+    call_count = float(len(df))
+    freq_centers = ((df['freq_low_hz'] + df['freq_high_hz']) / 2.0).values.astype(np.float32)
+    freq_bw = np.abs((df['freq_high_hz'] - df['freq_low_hz']).values).astype(np.float32)
+
+    return np.array([
+        call_count,
+        call_count / max(span, 1.0),
+        durations.mean(),
+        durations.std() if len(durations) > 1 else 0.0,
+        freq_centers.mean(),
+        freq_centers.std() if len(freq_centers) > 1 else 0.0,
+        freq_bw.mean(),
+        freq_bw.std() if len(freq_bw) > 1 else 0.0,
+    ], dtype=np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,17 +253,10 @@ def extract_split_features(
         recording_meta.append((int(label), list(feats)))
         class_calls.setdefault(int(label), []).extend(list(feats))
 
-    if augment and class_calls:
-        class_calls = augment_to_balance(
-            class_calls, noise_std=noise_std, random_seed=random_seed
+    if augment and recording_meta:
+        recording_meta = augment_recordings_to_balance(
+            recording_meta, noise_std=noise_std, random_seed=random_seed
         )
-        # Append synthetic calls as a virtual recording per minority class
-        real_counts = {lbl: sum(len(c) for l2, c in recording_meta if l2 == lbl)
-                       for lbl in class_calls}
-        for label, all_calls in class_calls.items():
-            synthetic = all_calls[real_counts.get(label, 0):]
-            if synthetic:
-                recording_meta.append((label, synthetic))
 
     return recording_meta, class_calls
 
@@ -264,8 +322,12 @@ def evaluate(model, loader, criterion, device, n_classes):
     preds = np.array(all_preds)
     labels = np.array(all_labels)
     probs = np.array(all_probs)
-    target_names = [LABEL_NAMES.get(i, f"class_{i}") for i in range(n_classes)]
-    report = classification_report(labels, preds, target_names=target_names,
+    _BINARY_NAMES = {0: 'healthy', 1: 'twitcher'}
+    _label_map = _BINARY_NAMES if n_classes == 2 else LABEL_NAMES
+    target_names = [_label_map.get(i, f"class_{i}") for i in range(n_classes)]
+    report = classification_report(labels, preds,
+                                   labels=list(range(n_classes)),
+                                   target_names=target_names,
                                    output_dict=True, zero_division=0)
     return {
         "loss": total_loss / n,
@@ -284,24 +346,34 @@ def evaluate(model, loader, criterion, device, n_classes):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(config: dict, data_dir: str, detections_dir: str,
-          cache_dir: str | None = None):
+          cache_dir: str | None = None, job_id: str | None = None):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
 
     seed = config.get("seed", 42)
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # Output directory
+    # ── Output directory (named by job_id when running under SLURM) ──────────
+    job_id = job_id or os.environ.get("SLURM_JOB_ID", "")
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_name = f"job_{job_id}_{timestamp}" if job_id else f"run_{timestamp}"
     out_root = Path(config.get("output_directory", "outputs"))
-    run_dir = out_root / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir = out_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    plog = ProgressLogger(run_dir / "progress.log")
+    plog.log(f"=== USV Classifier Training ===")
+    plog.log(f"Job ID   : {job_id or 'local run'}")
+    plog.log(f"Run dir  : {run_dir}")
+    plog.log(f"Device   : {device}")
+
     with open(run_dir / "config.yaml", "w") as f:
         yaml.dump(config, f)
 
     if cache_dir:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        plog.log(f"Cache dir: {cache_dir}")
 
     cfg_enc  = config["encoder"]
     cfg_spec = config["spectrogram"]
@@ -311,9 +383,14 @@ def train(config: dict, data_dir: str, detections_dir: str,
     n_classes = config.get("n_classes", 3)
 
     # ── 1. Discover recordings ────────────────────────────────────────────────
-    wav_paths, csv_paths, labels = find_recordings(
+    wav_paths, csv_paths, labels, _litter_ids = find_recordings(
         data_dir, detections_dir, n_classes
     )
+    _bin_names = {0: 'healthy', 1: 'twitcher'}
+    _display_names = _bin_names if n_classes == 2 else LABEL_NAMES
+    class_counts = {_display_names.get(lbl, lbl): int((labels == lbl).sum())
+                    for lbl in np.unique(labels)}
+    plog.log(f"Recordings: {len(wav_paths)} found | {class_counts}")
     print(f"\nFound {len(wav_paths)} recordings")
     for lbl in np.unique(labels):
         print(f"  {LABEL_NAMES.get(lbl, lbl)}: {(labels == lbl).sum()}")
@@ -328,6 +405,7 @@ def train(config: dict, data_dir: str, detections_dir: str,
         val_ratio=cfg_spl.get("val_ratio", 0.15),
         random_seed=cfg_spl.get("random_seed", seed),
     )
+    plog.log(f"Split    : train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
     print(f"\nSplit: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
 
     def subset(idx):
@@ -345,6 +423,7 @@ def train(config: dict, data_dir: str, detections_dir: str,
         extraction_point=cfg_enc["extraction_point"],
         device=cfg_enc.get("device", "cpu"),
     )
+    plog.log(f"Encoder  : {cfg_enc['extraction_point']} ({encoder.output_dim}-dim)")
     print(f"  Output dim: {encoder.output_dim}")
 
     # ── 4. Set up pooler ──────────────────────────────────────────────────────
@@ -362,6 +441,7 @@ def train(config: dict, data_dir: str, detections_dir: str,
     print(f"  Pooler: {pooler}")
 
     # ── 5. Extract features per split ─────────────────────────────────────────
+    plog.log("Extracting features (cached recordings will load instantly)...")
     print("\nExtracting features...")
 
     def _extract(idx, augment=False, label=""):
@@ -394,6 +474,8 @@ def train(config: dict, data_dir: str, detections_dir: str,
     X_val   = (X_val   - feat_mean) / feat_std
     X_test  = (X_test  - feat_mean) / feat_std
 
+    plog.log(f"Features : {X_train.shape[1]}-dim | "
+             f"train={X_train.shape[0]}, val={X_val.shape[0]}, test={X_test.shape[0]}")
     print(f"\nFeature shape: {X_train.shape[1]}-dim")
     print(f"Train: {X_train.shape[0]} samples  Val: {X_val.shape[0]}  Test: {X_test.shape[0]}")
 
@@ -442,6 +524,7 @@ def train(config: dict, data_dir: str, detections_dir: str,
     best_ep   = 0
     stall     = 0
 
+    plog.log(f"Training : up to {n_epochs} epochs, patience={patience}, lr={cfg_tr.get('learning_rate', 1e-4)}")
     print(f"\nTraining for up to {n_epochs} epochs (patience={patience})...")
     print("-" * 65)
 
@@ -474,6 +557,7 @@ def train(config: dict, data_dir: str, detections_dir: str,
             stall += 1
             if stall >= patience:
                 print(f"\nEarly stop at epoch {ep} (best={best_ep})")
+                plog.log(f"Early stop at epoch {ep} | best_epoch={best_ep}, best_val_loss={best_loss:.4f}")
                 break
 
     print("-" * 65)
@@ -484,11 +568,14 @@ def train(config: dict, data_dir: str, detections_dir: str,
     model.load_state_dict(ckpt["model_state_dict"])
     test_m = evaluate(model, test_loader, criterion, device, n_classes)
 
+    plog.log(f"TEST     : accuracy={test_m['accuracy']:.3f}, macro_F1={test_m['macro_f1']:.3f}")
     print(f"\nTest Results:")
     print(f"  Accuracy:  {test_m['accuracy']:.3f}")
     print(f"  Macro F1:  {test_m['macro_f1']:.3f}")
     print(f"\nConfusion Matrix (rows=true, cols=pred):")
-    print(f"  Classes: {[LABEL_NAMES.get(i) for i in range(n_classes)]}")
+    _bin = {0: 'healthy', 1: 'twitcher'}
+    _lm  = _bin if n_classes == 2 else LABEL_NAMES
+    print(f"  Classes: {[_lm.get(i) for i in range(n_classes)]}")
     cm = np.array(test_m["confusion_matrix"])
     print(f"  {cm}")
     print("\nPer-class:")
@@ -509,6 +596,7 @@ def train(config: dict, data_dir: str, detections_dir: str,
     with open(run_dir / "results.yaml", "w") as f:
         yaml.dump(results, f)
 
+    plog.log(f"Done     : results saved to {run_dir}")
     print(f"\nRun saved to: {run_dir}")
     return run_dir, results
 
@@ -518,7 +606,8 @@ def train(config: dict, data_dir: str, detections_dir: str,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cross_validate(config: dict, data_dir: str, detections_dir: str,
-                   cache_dir: str | None = None, n_folds: int = 5):
+                   cache_dir: str | None = None, n_folds: int = 5,
+                   job_id: str | None = None):
     """
     Stratified k-fold cross-validation over all recordings.
 
@@ -529,6 +618,20 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed    = config.get("seed", 42)
+
+    # Output directory for CV run
+    job_id = job_id or os.environ.get("SLURM_JOB_ID", "")
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_name = f"job_{job_id}_{timestamp}_cv{n_folds}" if job_id else f"run_{timestamp}_cv{n_folds}"
+    out_root = Path(config.get("output_directory", "outputs"))
+    run_dir = out_root / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    plog = ProgressLogger(run_dir / "progress.log")
+    plog.log(f"=== USV Classifier Cross-Validation ({n_folds} folds) ===")
+    plog.log(f"Job ID   : {job_id or 'local run'}")
+    plog.log(f"Run dir  : {run_dir}")
+    plog.log(f"Device   : {device}")
     n_classes = config.get("n_classes", 3)
     cfg_enc  = config["encoder"]
     cfg_spec = config["spectrogram"]
@@ -536,10 +639,27 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
     cfg_tr   = config.get("training", {})
     cfg_model = config.get("model", {})
 
-    wav_paths, csv_paths, labels = find_recordings(data_dir, detections_dir, n_classes)
+    wav_paths, csv_paths, labels, litter_ids = find_recordings(data_dir, detections_dir, n_classes)
+    _bin_names = {0: 'healthy', 1: 'twitcher'}
+    _display_names = _bin_names if n_classes == 2 else LABEL_NAMES
+    class_counts = {_display_names.get(lbl, lbl): int((labels == lbl).sum())
+                    for lbl in np.unique(labels)}
+    plog.log(f"Recordings: {len(wav_paths)} | {class_counts}")
     print(f"\nCross-validation: {n_folds} folds over {len(wav_paths)} recordings")
     for lbl in np.unique(labels):
         print(f"  {LABEL_NAMES.get(lbl, lbl)}: {(labels == lbl).sum()}")
+
+    # Litter-aware grouping — keeps all siblings in the same fold
+    unique_litters = sorted(set(litter_ids))
+    litter_to_int  = {l: i for i, l in enumerate(unique_litters)}
+    groups = np.array([litter_to_int[l] for l in litter_ids])
+    print(f"  Litters: {len(unique_litters)} ({unique_litters})")
+    plog.log(f"Litters  : {len(unique_litters)} groups")
+
+    # Acoustic summary features (8-dim) for every recording — loaded from CSV
+    print("Computing acoustic summary statistics...")
+    acous_all   = np.array([compute_acoustic_stats(p) for p in csv_paths], dtype=np.float32)
+    valid_mask  = acous_all[:, 0] > 0   # call_count > 0; False for empty recordings
 
     weights_path = config.get("squeakout_weights", "../squeakout/squeakout_weights.ckpt")
     encoder = SqueakOutEncoder(
@@ -550,13 +670,14 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
     pooler_name   = config.get("pooler", "average")
     pooler_kwargs = {"n_features": encoder.output_dim}
 
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     all_true = np.array(labels, dtype=np.int64)
     preds_svm = np.full(len(labels), -1, dtype=np.int64)
     preds_rf  = np.full(len(labels), -1, dtype=np.int64)
     preds_mlp = np.full(len(labels), -1, dtype=np.int64)
 
-    for fold, (tr_idx, te_idx) in enumerate(skf.split(range(len(labels)), all_true)):
+    for fold, (tr_idx, te_idx) in enumerate(sgkf.split(range(len(labels)), all_true, groups)):
+        plog.log(f"Fold {fold + 1}/{n_folds} (train={len(tr_idx)}, test={len(te_idx)})")
         print(f"\n── Fold {fold + 1}/{n_folds} "
               f"(train={len(tr_idx)}, test={len(te_idx)}) ──")
 
@@ -567,7 +688,8 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
         inner_tr = list(tr_idx[:-n_val])
         inner_val = list(tr_idx[-n_val:])
 
-        def _feat(idx_list, augment=False):
+        def _get_meta(idx_list):
+            """Extract real (un-augmented) recording_meta for a set of indices."""
             w = [wav_paths[i] for i in idx_list]
             c = [csv_paths[i] for i in idx_list]
             l = all_true[idx_list]
@@ -575,15 +697,58 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
                 w, c, l, encoder,
                 cache_dir=Path(cache_dir) if cache_dir else None,
                 cfg_enc=cfg_enc, cfg_spec=cfg_spec,
-                augment=augment,
+                augment=False,
                 noise_std=cfg_aug.get("noise_std", 0.05),
                 random_seed=seed,
             )
-            return pool_recordings(meta, pooler)
+            return meta
 
-        X_tr,  y_tr  = _feat(inner_tr,  augment=cfg_aug.get("enabled", True))
-        X_val, y_val = _feat(inner_val, augment=False)
-        X_te,  y_te  = _feat(list(te_idx), augment=False)
+        meta_tr = _get_meta(inner_tr)
+        if cfg_aug.get("enabled", True):
+            strategy = cfg_aug.get("strategy", "mixing")
+            if strategy == "mixing":
+                meta_tr = augment_by_cross_litter_mixing(
+                    meta_tr,
+                    n_sources=cfg_aug.get("n_sources", 2),
+                    target_multiplier=cfg_aug.get("target_multiplier", 1.0),
+                    random_seed=seed,
+                )
+            else:
+                meta_tr = augment_recordings_to_balance(
+                    meta_tr,
+                    noise_std=cfg_aug.get("noise_std", 0.05),
+                    random_seed=seed,
+                )
+
+        X_tr,  y_tr  = pool_recordings(meta_tr, pooler)
+        X_val, y_val = pool_recordings(_get_meta(inner_val),    pooler)
+        X_te,  y_te  = pool_recordings(_get_meta(list(te_idx)), pooler)
+
+        # ── Acoustic summary features ─────────────────────────────────────────
+        # Real rows: use per-recording stats from CSV.
+        # Synthetic rows (appended by augmentation): impute per-class mean of
+        # the real training acoustic stats.
+        valid_tr  = [i for i in inner_tr   if valid_mask[i]]
+        valid_val = [i for i in inner_val  if valid_mask[i]]
+        valid_te  = [i for i in list(te_idx) if valid_mask[i]]
+
+        acous_real_tr = acous_all[valid_tr]                # (n_orig_tr, 8)
+        n_orig_tr     = len(valid_tr)
+        n_synth       = len(y_tr) - n_orig_tr
+        if n_synth > 0:
+            cls_mean = {cls: acous_real_tr[y_tr[:n_orig_tr] == cls].mean(0)
+                        for cls in np.unique(y_tr[:n_orig_tr])}
+            synth_rows = np.array([cls_mean[lbl] for lbl in y_tr[n_orig_tr:]])
+            acous_tr = np.vstack([acous_real_tr, synth_rows])
+        else:
+            acous_tr = acous_real_tr
+
+        acous_val = acous_all[valid_val]
+        acous_te  = acous_all[valid_te]
+
+        X_tr  = np.hstack([X_tr,  acous_tr])
+        X_val = np.hstack([X_val, acous_val])
+        X_te  = np.hstack([X_te,  acous_te])
 
         mean = X_tr.mean(0)
         std  = np.maximum(X_tr.std(0), 1e-8)
@@ -642,22 +807,39 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
         preds_mlp[te_idx[:len(y_te)]] = tm["preds"]
 
     # ── Aggregate results ─────────────────────────────────────────────────────
-    target_names = [LABEL_NAMES.get(i, f"class_{i}") for i in range(n_classes)]
-    valid = all_true[preds_svm != -1]  # guard against any skipped folds
+    _BINARY_NAMES = {0: 'healthy', 1: 'twitcher'}
+    _label_map = _BINARY_NAMES if n_classes == 2 else LABEL_NAMES
+    target_names = [_label_map.get(i, f"class_{i}") for i in range(n_classes)]
 
     print(f"\n{'='*65}")
     print(f"Cross-validation results ({n_folds} folds, {len(labels)} recordings)")
     print(f"{'='*65}")
+    plog.log(f"=== CV Results ({n_folds} folds, {len(labels)} recordings) ===")
+
+    cv_results = {"n_folds": n_folds, "n_recordings": len(labels), "models": {}}
     for name, preds in [("SVM (rbf)", preds_svm), ("Random Forest", preds_rf), ("MLP", preds_mlp)]:
         mask = preds != -1
         t, p = all_true[mask], preds[mask]
         macro = sk_f1(t, p, average='macro', zero_division=0)
         acc   = (t == p).mean()
+        report = classification_report(t, p, target_names=target_names,
+                                       output_dict=True, zero_division=0)
+        plog.log(f"{name:15s}: accuracy={acc:.3f}, macro_F1={macro:.3f}")
         print(f"\n{name}  —  accuracy={acc:.3f}  macro_F1={macro:.3f}")
         print(classification_report(t, p, target_names=target_names, zero_division=0))
         print("Confusion matrix (rows=true, cols=pred):")
         print(confusion_matrix(t, p))
+        cv_results["models"][name] = {
+            "accuracy": float(acc),
+            "macro_f1": float(macro),
+            "classification_report": report,
+            "confusion_matrix": confusion_matrix(t, p).tolist(),
+        }
     print(f"{'='*65}\n")
+
+    with open(run_dir / "results.yaml", "w") as f:
+        yaml.dump(cv_results, f)
+    plog.log(f"Done     : results saved to {run_dir}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -679,10 +861,13 @@ def main():
                         help="Directory to cache per-recording encoder features. "
                              "Highly recommended on the cluster: extracts once, "
                              "reuses for every subsequent training run.")
-    parser.add_argument("--cv_folds", type=int, default=0,
+    parser.add_argument("--cv_folds", type=int, default=5,
                         help="Run k-fold cross-validation instead of a fixed split. "
                              "Recommended for small datasets (e.g. --cv_folds 5). "
-                             "0 = use fixed train/val/test split (default).")
+                             "0 = use fixed train/val/test split.")
+    parser.add_argument("--job_id", default=None,
+                        help="SLURM job ID for naming the output directory. "
+                             "Auto-detected from $SLURM_JOB_ID if not provided.")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -690,9 +875,10 @@ def main():
 
     if args.cv_folds > 1:
         cross_validate(config, args.data_dir, args.detections_dir,
-                       args.cache_dir, n_folds=args.cv_folds)
+                       args.cache_dir, n_folds=args.cv_folds, job_id=args.job_id)
     else:
-        train(config, args.data_dir, args.detections_dir, args.cache_dir)
+        train(config, args.data_dir, args.detections_dir, args.cache_dir,
+              job_id=args.job_id)
 
 
 if __name__ == "__main__":

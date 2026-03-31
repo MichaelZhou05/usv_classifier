@@ -47,16 +47,22 @@ swe:
 # ── Class-balance augmentation ────────────────────────────────────────────────
 augmentation:
   enabled: true
-  # Noise level as fraction of each class' per-feature standard deviation.
-  # 0.05 = 5% noise — small enough to preserve call identity, large enough
-  # to diversify the synthetic samples.
+  # strategy: "mixing"  — cross-litter call mixing (recommended)
+  #           "noise"   — Gaussian noise on cloned recordings (legacy)
+  strategy: "mixing"
+  # Cross-litter mixing parameters (used when strategy = "mixing"):
+  #   n_sources:         recordings to combine per synthetic (2 = pairs, 3 = triples)
+  #   target_multiplier: 1.0 = balance to majority class; 3.0 = 3× majority
+  n_sources: 2
+  target_multiplier: 1.0
+  # Noise parameters (used when strategy = "noise"):
   noise_std: 0.05
   random_seed: 42
   # NOTE: augmentation is applied only to the training split.
   # Val and test sets always use real data only.
 
 # ── Classification model ──────────────────────────────────────────────────────
-n_classes: 3                   # twitcher=0, wildtype=1, het=2
+n_classes: 2                   # 0=healthy (wildtype+het), 1=twitcher
 
 model:
   # Input dim is computed at runtime as pooler.output_dim

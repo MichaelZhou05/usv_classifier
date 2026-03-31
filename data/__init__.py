@@ -6,6 +6,8 @@ from .squeakout_features import (
     SqueakOutEncoder,
     extract_recording_features,
     augment_to_balance,
+    augment_recordings_to_balance,
+    augment_by_cross_litter_mixing,
     build_squeakout_dataset,
 )
 
@@ -20,5 +22,7 @@ __all__ = [
     "SqueakOutEncoder",
     "extract_recording_features",
     "augment_to_balance",
+    "augment_recordings_to_balance",
+    "augment_by_cross_litter_mixing",
     "build_squeakout_dataset",
 ]
