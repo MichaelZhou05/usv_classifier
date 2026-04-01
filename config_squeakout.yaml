@@ -47,15 +47,15 @@ swe:
 # ── Class-balance augmentation ────────────────────────────────────────────────
 augmentation:
   enabled: true
-  # strategy: "mixing"  — cross-litter call mixing (recommended)
-  #           "noise"   — Gaussian noise on cloned recordings (legacy)
-  strategy: "mixing"
+  # strategy: "mixing"  — cross-litter call mixing (recommended for train.py)
+  #           "noise"   — Gaussian noise on cloned recordings
+  strategy: "noise"
   # Cross-litter mixing parameters (used when strategy = "mixing"):
   #   n_sources:         recordings to combine per synthetic (2 = pairs, 3 = triples)
   #   target_multiplier: 1.0 = balance to majority class; 3.0 = 3× majority
   n_sources: 2
   target_multiplier: 1.0
-  # Noise parameters (used when strategy = "noise"):
+  # Noise parameters (used when strategy = "noise" and by train_finetune.py):
   noise_std: 0.05
   random_seed: 42
   # NOTE: augmentation is applied only to the training split.
@@ -89,3 +89,17 @@ splits:
   stratify: true
 
 normalize_features: true
+
+# ── Fine-tuning (train_finetune.py only) ─────────────────────────────────────
+# Fine-tunes the last few MobileNetV2 blocks of the SqueakOut encoder end-to-end.
+# Blocks 0..(finetune_from_block-1) remain frozen; blocks finetune_from_block..13
+# are trained with lr_encoder (much lower than lr_classifier).
+#
+# For x4 extraction the backbone has 14 blocks (0-13):
+#   blocks 0-6  → low-level edge/texture features  (keep frozen)
+#   blocks 7-9  → mid-level patterns               (optional to freeze)
+#   blocks 10-13→ high-level semantics              (fine-tune these)
+finetune:
+  finetune_from_block: 10   # unfreeze blocks 10-13 (last 4 of 14 for x4)
+  lr_encoder:   0.00001     # very low lr for pretrained blocks
+  lr_classifier: 0.001      # normal lr for the MLP head

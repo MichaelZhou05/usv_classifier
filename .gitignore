@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Job logs (SLURM)
+logs/
+
+# Training outputs (model checkpoints, results)
+outputs/
+
+# Cached spectrograms / frozen features
+frozen_cache/
+spec_cache/
+
+# Numpy / data artifacts
+*.npy
+*.npz
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
