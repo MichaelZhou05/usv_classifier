@@ -34,7 +34,7 @@ spectrogram:
 # Aggregates the per-call feature vectors into one vector per recording.
 # Primary options: "swe" (best, learns optimal transport embedding)
 #                  "average" (fast baseline, good for tiny datasets)
-pooler: "average"
+pooler: "swe"
 
 # SWE-specific settings (only used when pooler = "swe")
 swe:
