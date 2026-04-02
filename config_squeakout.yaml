@@ -40,7 +40,7 @@ pooler: "swe"
 swe:
   # n_features is set automatically to encoder.output_dim at runtime
   num_slices: 16               # number of random projection directions
-  num_ref_points: 10           # resolution of the CDF approximation
+  num_ref_points: 16           # resolution of the CDF approximation
   freeze_swe: false            # true = fixed random projections (faster)
   flatten: true                # output dim = num_slices * num_ref_points
 
