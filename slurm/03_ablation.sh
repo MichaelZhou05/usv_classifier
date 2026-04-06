@@ -1,34 +1,26 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# SLURM Job: Stage 2 — Feature extraction + MLP training
+# SLURM Job Array: Ablation study — 8 conditions (2x2x2)
 #
-# Depends on 01_detect.sh completing successfully (all CSVs present).
+# Factors:
+#   1. Gaussian augmentation:  ON / OFF
+#   2. Extra features:         ALL (encoder+spectral+acoustic) / ENCODER_ONLY
+#   3. Pooling:                SWE / AVERAGE
 #
-# First run:   extracts SqueakOut encoder features → saves to CACHE_DIR
-#              then trains the MLP classifier
-# Re-runs:     skips encoder (loads cached features), only re-trains MLP
-#              → fast iteration on hyperparameters
-#
-# Submit after detection is complete:
-#   sbatch slurm/02_train.sh
-#
-# Or submit with dependency on the detect array job:
-#   DETECT_JOB=$(sbatch --parsable slurm/01_detect.sh)
-#   sbatch --dependency=afterok:$DETECT_JOB slurm/02_train.sh
-#
-# Monitor progress (without reading the full log):
-#   cat outputs/job_<JOBID>_*/progress.log
+# Submit:
+#   sbatch slurm/03_ablation.sh
 # ─────────────────────────────────────────────────────────────────────────────
 
-#SBATCH --job-name=usv_train
+#SBATCH --job-name=usv_ablation
 #SBATCH -p scavenger-h200
 #SBATCH -A scavenger-h200
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
-#SBATCH --output=logs/train_%j.out
-#SBATCH --error=logs/train_%j.err
+#SBATCH --array=0-7
+#SBATCH --output=logs/ablation_%A_%a.out
+#SBATCH --error=logs/ablation_%A_%a.err
 
 # ── Project paths ─────────────────────────────────────────────────────────────
 PROJECT_DIR="/hpc/group/naderilab/zz394/Mice"
@@ -40,45 +32,71 @@ CACHE_DIR="${PROJECT_DIR}/feature_cache"
 
 mkdir -p "${REPO_DIR}/logs" "${CACHE_DIR}"
 
+# ── Decode array task ID into 3 binary factors ──
+# Bit 0: augmentation (0=ON, 1=OFF)
+# Bit 1: features     (0=ALL, 1=ENCODER_ONLY)
+# Bit 2: pooling      (0=SWE, 1=AVERAGE)
+TASK=${SLURM_ARRAY_TASK_ID}
+
+AUG_OFF=$(( (TASK >> 0) & 1 ))
+ENC_ONLY=$(( (TASK >> 1) & 1 ))
+AVG_POOL=$(( (TASK >> 2) & 1 ))
+
+# Build CLI flags
+EXTRA_FLAGS=""
+LABEL="aug"
+
+if [ ${AUG_OFF} -eq 1 ]; then
+    EXTRA_FLAGS="${EXTRA_FLAGS} --no_augmentation"
+    LABEL="noaug"
+else
+    LABEL="aug"
+fi
+
+if [ ${ENC_ONLY} -eq 1 ]; then
+    EXTRA_FLAGS="${EXTRA_FLAGS} --encoder_only"
+    LABEL="${LABEL}_enconly"
+else
+    LABEL="${LABEL}_allfeat"
+fi
+
+if [ ${AVG_POOL} -eq 1 ]; then
+    EXTRA_FLAGS="${EXTRA_FLAGS} --pooler average"
+    LABEL="${LABEL}_avg"
+else
+    EXTRA_FLAGS="${EXTRA_FLAGS} --pooler swe"
+    LABEL="${LABEL}_swe"
+fi
+
 echo "============================================================"
-echo "  USV Classifier Training"
-echo "  Job ID   : ${SLURM_JOB_ID}"
+echo "  USV Ablation Study — Condition ${TASK}/7"
+echo "  Label    : ${LABEL}"
+echo "  Flags    : ${EXTRA_FLAGS}"
+echo "  Job ID   : ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
 echo "  Start    : $(date)"
-echo "  Audio    : ${AUDIO_DIR}"
-echo "  Detects  : ${DETECTIONS_DIR}"
-echo "  Cache    : ${CACHE_DIR}"
 echo "============================================================"
 
 module purge
-module load Python/3.11.3-GCCcore-12.3.0
+module load Anaconda3/2024.02
+eval "$(conda shell.bash hook)"
+conda activate base
 
 cd "${REPO_DIR}" || { echo "ERROR: could not cd to ${REPO_DIR}"; exit 1; }
 
-# Check that all WAV files have a corresponding detections CSV
-N_WAV=$(ls "${AUDIO_DIR}"/*.wav 2>/dev/null | wc -l)
-N_CSV=$(ls "${DETECTIONS_DIR}"/*.csv 2>/dev/null | wc -l)
-echo "WAV files : ${N_WAV}"
-echo "CSVs found: ${N_CSV}"
-if [ "${N_CSV}" -lt "${N_WAV}" ]; then
-    echo "WARNING: $((N_WAV - N_CSV)) recordings missing detection CSVs."
-    echo "Re-run slurm/01_detect.sh for missing files before training."
-fi
-
-python train.py \
+python train_enhanced.py \
     --config         config_squeakout.yaml \
     --data_dir       "${AUDIO_DIR}" \
     --detections_dir "${DETECTIONS_DIR}" \
     --cache_dir      "${CACHE_DIR}" \
-    --job_id         "${SLURM_JOB_ID}" \
-    --cv_folds       5
+    --cv_folds       5 \
+    --job_id         "${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}" \
+    ${EXTRA_FLAGS}
 
 EXIT_CODE=$?
 
 echo "============================================================"
-echo "  Training complete (exit code: ${EXIT_CODE})"
+echo "  Condition ${LABEL} complete (exit code: ${EXIT_CODE})"
 echo "  End      : $(date)"
-echo "  Progress : cat ${REPO_DIR}/outputs/job_${SLURM_JOB_ID}_*/progress.log"
-echo "  Full log : ${REPO_DIR}/logs/train_${SLURM_JOB_ID}.out"
 echo "============================================================"
 
 exit ${EXIT_CODE}

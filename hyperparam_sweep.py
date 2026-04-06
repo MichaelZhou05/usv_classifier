@@ -30,7 +30,7 @@ from data.spectral_features import (
     extract_recording_spectral_features, N_CALL_FEATURES,
 )
 from train import find_recordings, compute_acoustic_stats, extract_or_load
-from train_enhanced import extract_combined_features, augment_meta_pair, pool_and_combine
+from train_enhanced import extract_combined_features, balance_class_indices, pool_and_combine
 from pooling.swe import SWEPooler
 from pooling import PoolerRegistry
 
@@ -95,11 +95,13 @@ def main():
 
     results = []
 
+    swe_flatten = config.get("swe", {}).get("flatten", False)
+
     for num_slices, num_refs in [(8, 8), (16, 10), (16, 16), (24, 12), (32, 16)]:
         enc_pooler = SWEPooler(n_features=enc_dim, num_slices=num_slices,
-                               num_ref_points=num_refs, freeze_swe=True, flatten=True)
+                               num_ref_points=num_refs, freeze_swe=True, flatten=swe_flatten)
         spec_pooler = SWEPooler(n_features=spec_dim, num_slices=num_slices,
-                                num_ref_points=num_refs, freeze_swe=True, flatten=True)
+                                num_ref_points=num_refs, freeze_swe=True, flatten=swe_flatten)
 
         X, y = pool_and_combine(enc_meta, spec_meta, enc_pooler, spec_pooler, acous_all)
         pooler_desc = f"SWE-{num_slices}x{num_refs}"

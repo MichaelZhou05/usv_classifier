@@ -11,10 +11,10 @@ Pipeline
       ↓
   generate_call_spectrogram()   — fixed 512×512 window per call
       ↓
+  add_spectrogram_noise()       — Gaussian noise at input level
+      ↓                           (augmented training copies only, per epoch)
   SqueakOutEncoder.forward()    — 1280-dim latent vector per call
       ↓
-  augment_to_balance()          — Gaussian noise on minority classes
-      ↓                           (training split only)
   pooler.pool()                 — SWE or average → single recording vector
       ↓
   MLP classifier                — twitcher | wildtype | het
@@ -355,8 +355,77 @@ def extract_recording_features(
     return encoder.encode_batch(spectrograms, batch_size=batch_size)
 
 
+def extract_recording_spectrograms(
+    audio_path: str,
+    detections_csv: str,
+    window_duration_sec: float = 0.30,
+    freq_min: int = 30_000,
+    freq_max: int = 130_000,
+) -> list[np.ndarray]:
+    """
+    Extract raw spectrograms for every detected call in one recording.
+
+    Same audio loading and windowing logic as extract_recording_features, but
+    returns the spectrograms themselves (before encoding) so that input-level
+    augmentation can be applied before the encoder.
+
+    Returns:
+        List of (512, 512) float32 arrays with values in [0, 1].
+        Empty list if no calls are detected.
+    """
+    audio, sr = librosa.load(audio_path, sr=None, mono=True)
+    detections = pd.read_csv(detections_csv)
+
+    required = {'start_sec', 'end_sec'}
+    if not required.issubset(detections.columns):
+        raise ValueError(
+            f"{detections_csv} must contain columns {required}. "
+            f"Found: {list(detections.columns)}"
+        )
+
+    return [
+        generate_call_spectrogram(
+            audio, sr,
+            start_sec=float(row['start_sec']),
+            end_sec=float(row['end_sec']),
+            window_duration_sec=window_duration_sec,
+            freq_min=freq_min,
+            freq_max=freq_max,
+        )
+        for _, row in detections.iterrows()
+    ]
+
+
+def add_spectrogram_noise(
+    spectrograms: list[np.ndarray],
+    noise_std: float,
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
+    """
+    Add Gaussian noise to spectrograms at the input level (before encoding).
+
+    Each spectrogram is perturbed independently with i.i.d. Gaussian noise,
+    then clipped to [0, 1] to stay within valid pixel range.
+
+    Args:
+        spectrograms: List of (512, 512) float32 arrays in [0, 1].
+        noise_std:    Standard deviation of the additive noise.
+        rng:          NumPy random generator for reproducibility.
+
+    Returns:
+        List of noisy spectrograms, same shape and dtype.
+    """
+    return [
+        np.clip(
+            spec + rng.normal(0.0, noise_std, size=spec.shape).astype(np.float32),
+            0.0, 1.0,
+        )
+        for spec in spectrograms
+    ]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# 4. Class-balance augmentation in feature space
+# 4. Class-balance augmentation
 # ──────────────────────────────────────────────────────────────────────────────
 
 def augment_recordings_to_balance(

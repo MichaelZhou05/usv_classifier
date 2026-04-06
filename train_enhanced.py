@@ -44,13 +44,16 @@ if 'pytorch_lightning' not in sys.modules:
     sys.modules['pytorch_lightning'] = MagicMock()
 
 from data import infer_label_from_filename, LABEL_NAMES
-from data.squeakout_features import SqueakOutEncoder
+from data.squeakout_features import (
+    SqueakOutEncoder, add_spectrogram_noise,
+)
 from data.spectral_features import (
     extract_recording_spectral_features, summarize_call_features,
     N_CALL_FEATURES, summary_feature_dim,
 )
 from train import (
     find_recordings, compute_acoustic_stats, extract_or_load,
+    extract_or_load_spectrograms,
     pool_recordings, make_loader, train_epoch, evaluate,
     ProgressLogger,
 )
@@ -114,45 +117,32 @@ def extract_combined_features(
     return enc_meta, spec_meta, np.array(valid_idx)
 
 
-def augment_meta_pair(enc_meta, spec_meta, noise_std=0.05, seed=42):
-    """Augment both enc and spec meta lists in parallel to keep them aligned."""
-    from data.squeakout_features import augment_recordings_to_balance
-
+def balance_class_indices(labels, seed=42):
+    """Compute balanced indices: [(src_idx, is_augmented)] for class balancing."""
     rng = np.random.default_rng(seed)
+    class_indices: dict[int, list[int]] = {}
+    for i, lbl in enumerate(labels):
+        class_indices.setdefault(lbl, []).append(i)
+    target = max(len(idxs) for idxs in class_indices.values())
 
-    class_recs = {}
-    for idx, (label, _) in enumerate(enc_meta):
-        class_recs.setdefault(label, []).append(idx)
-
-    target = max(len(idxs) for idxs in class_recs.values())
-
-    aug_enc = list(enc_meta)
-    aug_spec = list(spec_meta)
-
-    for label, idxs in class_recs.items():
+    result = [(i, False) for i in range(len(labels))]
+    for lbl, idxs in class_indices.items():
         n = len(idxs)
         if n >= target:
             continue
         for _ in range(target - n):
-            donor_idx = idxs[rng.integers(0, n)]
-            # Clone encoder features with noise
-            enc_calls = np.stack(enc_meta[donor_idx][1])
-            enc_std = np.maximum(enc_calls.std(axis=0), 1e-8)
-            enc_noise = rng.normal(0, noise_std, size=enc_calls.shape) * enc_std
-            aug_enc.append((label, list(enc_calls + enc_noise)))
-            # Clone spectral features with noise
-            spec_calls = np.stack(spec_meta[donor_idx][1])
-            spec_std = np.maximum(spec_calls.std(axis=0), 1e-8)
-            spec_noise = rng.normal(0, noise_std, size=spec_calls.shape) * spec_std
-            aug_spec.append((label, list(spec_calls + spec_noise)))
-
-    return aug_enc, aug_spec
+            donor = idxs[rng.integers(0, n)]
+            result.append((donor, True))
+    return result
 
 
 def pool_and_combine(enc_meta, spec_meta, enc_pooler, spec_pooler,
-                     acous_stats=None):
+                     acous_stats=None, encoder_only=False):
     """
     Pool both feature types and concatenate into combined vectors.
+
+    Args:
+        encoder_only: If True, only use encoder features (skip spectral + acoustic).
 
     Returns: (X_combined, y_labels)
     """
@@ -163,16 +153,18 @@ def pool_and_combine(enc_meta, spec_meta, enc_pooler, spec_pooler,
         assert lbl_e == lbl_s, f"Label mismatch at index {i}"
 
         enc_arr = np.stack(enc_calls)
-        spec_arr = np.stack(spec_calls)
-
         enc_pooled = enc_pooler.pool(enc_arr)
-        spec_pooled = spec_pooler.pool(spec_arr)
 
-        combined = np.concatenate([enc_pooled, spec_pooled])
+        if encoder_only:
+            combined = enc_pooled
+        else:
+            spec_arr = np.stack(spec_calls)
+            spec_pooled = spec_pooler.pool(spec_arr)
+            combined = np.concatenate([enc_pooled, spec_pooled])
 
-        # Append acoustic stats if available
-        if acous_stats is not None and i < len(acous_stats):
-            combined = np.concatenate([combined, acous_stats[i]])
+            # Append acoustic stats if available
+            if acous_stats is not None and i < len(acous_stats):
+                combined = np.concatenate([combined, acous_stats[i]])
 
         features.append(combined)
         labels.append(lbl_e)
@@ -182,6 +174,7 @@ def pool_and_combine(enc_meta, spec_meta, enc_pooler, spec_pooler,
 
 def cross_validate_enhanced(
     config, data_dir, detections_dir, cache_dir=None, n_folds=5, job_id=None,
+    encoder_only=False,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed = config.get("seed", 42)
@@ -195,7 +188,10 @@ def cross_validate_enhanced(
     # Output directory
     job_id = job_id or os.environ.get("SLURM_JOB_ID", "")
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_name = f"job_{job_id}_{timestamp}_enhanced_cv{n_folds}" if job_id else f"run_{timestamp}_enhanced_cv{n_folds}"
+    aug_tag = "aug" if cfg_aug.get("enabled", True) else "noaug"
+    feat_tag = "enconly" if encoder_only else "allfeat"
+    pool_tag = config.get("pooler", "swe")
+    run_name = f"job_{job_id}_{timestamp}_{aug_tag}_{feat_tag}_{pool_tag}_cv{n_folds}" if job_id else f"run_{timestamp}_{aug_tag}_{feat_tag}_{pool_tag}_cv{n_folds}"
     out_root = Path(config.get("output_directory", "outputs"))
     run_dir = out_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -231,13 +227,24 @@ def cross_validate_enhanced(
         device=cfg_enc.get("device", "cpu"),
     )
 
-    # Extract all features
-    plog.log("Extracting features...")
-    print("\nExtracting encoder + spectral features...")
+    # Extract all features + spectrograms (for input-level augmentation)
+    plog.log("Extracting features + spectrograms...")
+    print("\nExtracting encoder + spectral features + spectrograms...")
     enc_meta_all, spec_meta_all, valid_idx = extract_combined_features(
         wav_paths, csv_paths, labels, encoder, cache_path, cfg_enc, cfg_spec,
     )
-    del encoder  # free memory
+
+    # Also extract raw spectrograms for per-epoch input-level noise augmentation
+    all_specs: list[list[np.ndarray]] = []
+    for i in valid_idx:
+        specs = extract_or_load_spectrograms(
+            wav_paths[i], csv_paths[i], cache_path,
+            window_sec=cfg_spec['window_duration_sec'],
+            freq_min=cfg_spec['freq_min'],
+            freq_max=cfg_spec['freq_max'],
+        )
+        all_specs.append(specs)
+    # Keep encoder loaded for per-epoch re-encoding of augmented copies
 
     valid_labels = labels[valid_idx]
     valid_groups = groups[valid_idx]
@@ -254,7 +261,8 @@ def cross_validate_enhanced(
 
     # Determine pooling approach
     pooler_name = config.get("pooler", "swe")
-    print(f"Pooler: {pooler_name}")
+    feat_label = "encoder_only" if encoder_only else "encoder+spectral+acoustic"
+    print(f"Pooler: {pooler_name} | Features: {feat_label}")
 
     # CV loop
     sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
@@ -273,20 +281,35 @@ def cross_validate_enhanced(
         inner_tr = list(tr_idx[:-n_val])
         inner_val = list(tr_idx[-n_val:])
 
-        enc_tr = [enc_meta_all[i] for i in inner_tr]
-        spec_tr = [spec_meta_all[i] for i in inner_tr]
         enc_val = [enc_meta_all[i] for i in inner_val]
         spec_val = [spec_meta_all[i] for i in inner_val]
         enc_te = [enc_meta_all[i] for i in te_idx]
         spec_te = [spec_meta_all[i] for i in te_idx]
 
-        # Augment training data
+        # Balance training classes (duplication only, noise applied per-epoch)
+        tr_labels = [enc_meta_all[i][0] for i in inner_tr]
+        noise_std = cfg_aug.get("noise_std", 0.05)
         if cfg_aug.get("enabled", True):
-            enc_tr, spec_tr = augment_meta_pair(
-                enc_tr, spec_tr,
-                noise_std=cfg_aug.get("noise_std", 0.05),
-                seed=seed + fold,
-            )
+            balanced_tr = balance_class_indices(tr_labels, seed=seed + fold)
+        else:
+            balanced_tr = [(i, False) for i in range(len(inner_tr))]
+
+        # Build initial (un-noised) training meta for SVM/RF
+        enc_tr: list[tuple[int, list[np.ndarray]]] = []
+        spec_tr: list[tuple[int, list[np.ndarray]]] = []
+        rng_fold = np.random.default_rng(seed + fold + 1000)
+        for src_i, is_aug in balanced_tr:
+            real_idx = inner_tr[src_i]
+            label = enc_meta_all[real_idx][0]
+            if is_aug:
+                noisy_specs = add_spectrogram_noise(all_specs[real_idx], noise_std, rng_fold)
+                noisy_feats = encoder.encode_batch(
+                    noisy_specs, batch_size=cfg_enc['batch_size']
+                )
+                enc_tr.append((label, list(noisy_feats)))
+            else:
+                enc_tr.append(enc_meta_all[real_idx])
+            spec_tr.append(spec_meta_all[real_idx])
 
         # Create poolers per fold
         if pooler_name == "swe":
@@ -326,18 +349,17 @@ def cross_validate_enhanced(
         acous_te = acous_all[list(te_idx)]
 
         # Pool + combine
-        X_tr, y_tr = pool_and_combine(enc_tr, spec_tr, enc_pooler, spec_pooler, acous_tr)
-        X_val, y_val = pool_and_combine(enc_val, spec_val, enc_pooler, spec_pooler, acous_val)
-        X_te, y_te = pool_and_combine(enc_te, spec_te, enc_pooler, spec_pooler, acous_te)
+        X_tr, y_tr = pool_and_combine(enc_tr, spec_tr, enc_pooler, spec_pooler, acous_tr, encoder_only)
+        X_val, y_val = pool_and_combine(enc_val, spec_val, enc_pooler, spec_pooler, acous_val, encoder_only)
+        X_te, y_te = pool_and_combine(enc_te, spec_te, enc_pooler, spec_pooler, acous_te, encoder_only)
 
         if fold == 0:
             print(f"  Combined feature dim: {X_tr.shape[1]}")
             plog.log(f"Feature dim: {X_tr.shape[1]}")
 
-        # Normalise
+        # Normalise (fit on training data)
         mean = X_tr.mean(0)
         std = np.maximum(X_tr.std(0), 1e-8)
-        X_tr = (X_tr - mean) / std
         X_val = (X_val - mean) / std
         X_te = (X_te - mean) / std
 
@@ -346,8 +368,9 @@ def cross_validate_enhanced(
             cls_counts_aug[lbl] = cls_counts_aug.get(lbl, 0) + 1
         print(f"  Train after aug: {cls_counts_aug}")
 
-        # sklearn (train+val)
-        X_sk = np.vstack([X_tr, X_val])
+        # SVM/RF use single-noise training set
+        X_tr_norm = (X_tr - mean) / std
+        X_sk = np.vstack([X_tr_norm, X_val])
         y_sk = np.concatenate([y_tr, y_val])
 
         svm = SVC(kernel='rbf', class_weight='balanced', C=1.0, gamma='scale')
@@ -359,7 +382,7 @@ def cross_validate_enhanced(
         rf.fit(X_sk, y_sk)
         preds_rf[te_idx[:len(y_te)]] = rf.predict(X_te)
 
-        # MLP
+        # MLP — per-epoch input-level augmentation
         counts = np.bincount(y_tr, minlength=n_classes).astype(float)
         weights = len(y_tr) / (n_classes * np.maximum(counts, 1))
         crit = nn.CrossEntropyLoss(
@@ -374,12 +397,55 @@ def cross_validate_enhanced(
         opt = torch.optim.Adam(model.parameters(),
                                lr=cfg_tr.get("learning_rate", 1e-3),
                                weight_decay=cfg_tr.get("weight_decay", 1e-4))
-        tr_loader = make_loader(X_tr, y_tr, cfg_tr.get("batch_size", 8), shuffle=True)
         val_loader = make_loader(X_val, y_val, cfg_tr.get("batch_size", 8), shuffle=False)
+
+        # Pre-generate a pool of noise realizations to avoid per-epoch re-encoding
+        N_NOISE_REALIZATIONS = 5
+        aug_indices = [(j, src_i) for j, (src_i, is_aug) in enumerate(balanced_tr) if is_aug]
+        noise_pool: list[list[tuple[int, list[np.ndarray]]]] = []
+        if aug_indices and cfg_aug.get("enabled", True):
+            for nr in range(N_NOISE_REALIZATIONS):
+                rng_nr = np.random.default_rng(seed + fold * 10000 + nr)
+                realization = {}
+                for j, src_i in aug_indices:
+                    real_idx = inner_tr[src_i]
+                    label = enc_meta_all[real_idx][0]
+                    noisy_specs = add_spectrogram_noise(
+                        all_specs[real_idx], noise_std, rng_nr
+                    )
+                    noisy_feats = encoder.encode_batch(
+                        noisy_specs, batch_size=cfg_enc['batch_size']
+                    )
+                    realization[j] = (label, list(noisy_feats))
+                noise_pool.append(realization)
+
+        # Pre-pool all noise realizations into ready-to-use training sets
+        pooled_train_sets = []
+        for nr in range(max(1, len(noise_pool))):
+            ep_enc: list[tuple[int, list[np.ndarray]]] = []
+            ep_spec: list[tuple[int, list[np.ndarray]]] = []
+            for j, (src_i, is_aug) in enumerate(balanced_tr):
+                real_idx = inner_tr[src_i]
+                if is_aug and noise_pool:
+                    ep_enc.append(noise_pool[nr][j])
+                else:
+                    ep_enc.append(enc_meta_all[real_idx])
+                ep_spec.append(spec_meta_all[real_idx])
+            X_nr, y_nr = pool_and_combine(
+                ep_enc, ep_spec, enc_pooler, spec_pooler, acous_tr, encoder_only
+            )
+            X_nr = (X_nr - mean) / std
+            pooled_train_sets.append((X_nr, y_nr))
 
         best_loss, stall, best_state = float("inf"), 0, None
         patience = cfg_tr.get("early_stopping_patience", 40)
+        rng_ep = np.random.default_rng(seed + fold * 10000)
         for ep in range(1, cfg_tr.get("n_epochs", 300) + 1):
+            # Pick a random pre-computed noise realization
+            nr_idx = rng_ep.integers(0, len(pooled_train_sets))
+            X_tr_ep, y_tr_ep = pooled_train_sets[nr_idx]
+            tr_loader = make_loader(X_tr_ep, y_tr_ep, cfg_tr.get("batch_size", 8), shuffle=True)
+
             train_epoch(model, tr_loader, crit, opt, device)
             vm = evaluate(model, val_loader, crit, device, n_classes)
             if vm["loss"] < best_loss:
@@ -402,11 +468,13 @@ def cross_validate_enhanced(
 
     print(f"\n{'='*65}")
     print(f"Enhanced CV results ({n_folds} folds, {len(valid_labels)} recordings)")
-    print(f"Pooler: {pooler_name} | Features: encoder+spectral+acoustic")
+    print(f"Pooler: {pooler_name} | Features: {feat_label}")
     print(f"{'='*65}")
 
     cv_results = {"n_folds": n_folds, "n_recordings": len(valid_labels),
-                  "pooler": pooler_name, "features": "encoder+spectral+acoustic",
+                  "pooler": pooler_name, "features": feat_label,
+                  "augmentation": cfg_aug.get("enabled", True),
+                  "encoder_only": encoder_only,
                   "models": {}}
 
     for name, preds in [("SVM (rbf)", preds_svm), ("Random Forest", preds_rf), ("MLP", preds_mlp)]:
@@ -448,14 +516,27 @@ def main():
     parser.add_argument("--cache_dir", default=None)
     parser.add_argument("--cv_folds", type=int, default=5)
     parser.add_argument("--job_id", default=None)
+    parser.add_argument("--no_augmentation", action="store_true",
+                        help="Disable Gaussian noise augmentation")
+    parser.add_argument("--encoder_only", action="store_true",
+                        help="Use only encoder features (no spectral/acoustic)")
+    parser.add_argument("--pooler", choices=["swe", "average"], default=None,
+                        help="Override pooler setting from config")
     args = parser.parse_args()
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
+    # Apply CLI overrides
+    if args.no_augmentation:
+        config.setdefault("augmentation", {})["enabled"] = False
+    if args.pooler:
+        config["pooler"] = args.pooler
+
     cross_validate_enhanced(
         config, args.data_dir, args.detections_dir,
         cache_dir=args.cache_dir, n_folds=args.cv_folds, job_id=args.job_id,
+        encoder_only=args.encoder_only,
     )
 
 

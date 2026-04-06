@@ -19,8 +19,9 @@ The frozen features are stored in `frozen_cache_dir/<stem>__fb<N>.npy`.
 Augmentation
 ────────────
 Minority-class recordings are duplicated to balance class counts.  The
-augmented copies run through the same unfrozen blocks but with Gaussian noise
-added to the per-call feature vectors before pooling (standard noise_std=0.05).
+augmented copies have Gaussian noise applied at the spectrogram level (before
+SqueakOut encoding) each epoch, producing fresh input-level perturbations.
+This is done before the frozen backbone blocks, not after the encoder.
 
 Usage
 ─────
@@ -63,7 +64,7 @@ if 'pytorch_lightning' not in sys.modules:
 from squeakout import SqueakOut  # noqa: E402
 
 from data import infer_label_from_filename, LABEL_NAMES
-from data.squeakout_features import generate_call_spectrogram
+from data.squeakout_features import generate_call_spectrogram, add_spectrogram_noise
 from models.mlp import EnrichedUSVClassifier
 
 
@@ -84,9 +85,11 @@ class FineTuneUSVModel(nn.Module):
         cached (N, C, H, W) feature maps    ← pre-computed from frozen blocks
             ↓  features[finetune_from..13]  ← fine-tuned (grads flow here)
             ↓  global average pool → (N, 96)
-            ↓  optional Gaussian noise      ← augmented recordings only
             ↓  mean over N calls → (1, 96)
             ↓  MLP classifier    → (1, n_classes)
+
+    Augmentation is applied at the input (spectrogram) level before frozen
+    feature computation, not after the encoder.
     """
 
     _N_BLOCKS = {'x4': 14, 'deep': 19}
@@ -126,8 +129,6 @@ class FineTuneUSVModel(nn.Module):
     def forward_from_frozen(
         self,
         frozen_feats: np.ndarray,
-        noise_std: float = 0.0,
-        apply_noise: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass starting from pre-frozen intermediate features.
@@ -135,8 +136,6 @@ class FineTuneUSVModel(nn.Module):
         Args:
             frozen_feats:  (N_calls, C, H, W) float32 numpy array —
                            output of backbone.features[0..finetune_from-1].
-            noise_std:     Gaussian noise amplitude (fraction of per-feature std).
-            apply_noise:   Add noise before pooling (True for augmented copies).
 
         Returns:
             (1, n_classes) logit tensor.
@@ -149,11 +148,6 @@ class FineTuneUSVModel(nn.Module):
             x = self.backbone.features[n](x)
 
         feats = x.mean(dim=[2, 3])  # global average pool → (N, 96)
-
-        if apply_noise and noise_std > 0.0 and self.training:
-            feat_std = feats.detach().std(0).clamp(min=1e-8)
-            feats = feats + torch.randn_like(feats) * noise_std * feat_std
-
         recording_vec = feats.mean(0, keepdim=True)  # (1, 96)
         return self.classifier(recording_vec)         # (1, n_classes)
 
@@ -161,7 +155,7 @@ class FineTuneUSVModel(nn.Module):
     def predict_from_frozen(self, frozen_feats: np.ndarray) -> int:
         """Eval-mode prediction from cached frozen features."""
         self.eval()
-        logits = self.forward_from_frozen(frozen_feats, noise_std=0.0, apply_noise=False)
+        logits = self.forward_from_frozen(frozen_feats)
         return int(logits.argmax(1).item())
 
 
@@ -283,33 +277,33 @@ def precompute_frozen_features(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def augment_train_data(
-    train_real: list[tuple[int, np.ndarray]],
+    train_real: list[tuple[int, np.ndarray, int]],
     random_seed: int = 42,
-) -> list[tuple[int, np.ndarray, bool]]:
+) -> list[tuple[int, np.ndarray, bool, int]]:
     """
     Balance class counts by duplicating minority-class recordings.
 
-    Augmented copies are marked apply_noise=True — the model adds Gaussian noise
-    to their encoder outputs before pooling, making each copy look slightly
-    different in feature space.
+    Augmented copies are marked is_augmented=True so the training loop knows to
+    apply input-level Gaussian noise to their spectrograms before recomputing
+    frozen features each epoch.
 
     Args:
-        train_real:   List of (label, frozen_feats) for real recordings.
+        train_real:   List of (label, frozen_feats, spec_index) for real recordings.
         random_seed:  RNG seed.
 
     Returns:
-        List of (label, frozen_feats, apply_noise).
+        List of (label, frozen_feats, is_augmented, spec_index).
     """
     rng = np.random.default_rng(random_seed)
 
-    class_recs: dict[int, list[np.ndarray]] = {}
-    for label, feats in train_real:
-        class_recs.setdefault(label, []).append(feats)
+    class_recs: dict[int, list[tuple[int, np.ndarray, int]]] = {}
+    for label, feats, si in train_real:
+        class_recs.setdefault(label, []).append((label, feats, si))
 
     target = max(len(recs) for recs in class_recs.values())
 
-    result: list[tuple[int, np.ndarray, bool]] = [
-        (label, feats, False) for label, feats in train_real
+    result: list[tuple[int, np.ndarray, bool, int]] = [
+        (label, feats, False, si) for label, feats, si in train_real
     ]
     for label, recs in class_recs.items():
         n = len(recs)
@@ -317,7 +311,7 @@ def augment_train_data(
             continue
         for _ in range(target - n):
             donor = recs[rng.integers(0, n)]
-            result.append((label, donor, True))
+            result.append((donor[0], donor[1], True, donor[2]))
 
     return result
 
@@ -328,18 +322,25 @@ def augment_train_data(
 
 def train_epoch_e2e(
     model: FineTuneUSVModel,
-    train_data: list[tuple[int, np.ndarray, bool]],
+    train_data: list[tuple[int, np.ndarray, bool, int]],
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     noise_std: float,
     accum_steps: int = 8,
+    all_specs: list | None = None,
+    frozen_backbone=None,
+    frozen_end: int = 10,
+    device: torch.device | None = None,
+    rng: np.random.Generator | None = None,
 ) -> tuple[float, float]:
     """
     One training epoch over pre-frozen features.
 
+    For augmented copies, applies Gaussian noise to the raw spectrograms and
+    recomputes frozen features through the frozen backbone blocks, so each
+    epoch sees different input-level perturbations.
+
     Gradients are accumulated over `accum_steps` recordings before each step.
-    Loss is normalised by the number of recordings so gradient magnitude is
-    independent of `accum_steps`.
     """
     model.train()
     total_loss, correct, total = 0.0, 0, 0
@@ -349,11 +350,22 @@ def train_epoch_e2e(
     perm = np.random.permutation(n)
 
     for step_i, idx in enumerate(perm, 1):
-        label, frozen_feats, apply_noise = train_data[int(idx)]
+        label, frozen_feats, is_aug, spec_idx = train_data[int(idx)]
         y = torch.tensor([label], dtype=torch.long, device=model._device)
 
-        logits = model.forward_from_frozen(frozen_feats, noise_std=noise_std,
-                                           apply_noise=apply_noise)
+        if is_aug and rng is not None and all_specs is not None and frozen_backbone is not None:
+            # Input-level augmentation: noise → re-run frozen blocks
+            noisy_specs = add_spectrogram_noise(all_specs[spec_idx], noise_std, rng)
+            X = torch.from_numpy(
+                np.stack(noisy_specs)[:, np.newaxis].astype(np.float32)
+            ).to(device or model._device)
+            with torch.no_grad():
+                x = X
+                for blk in range(frozen_end):
+                    x = frozen_backbone.features[blk](x)
+                frozen_feats = x.cpu().numpy()
+
+        logits = model.forward_from_frozen(frozen_feats)
         loss = criterion(logits, y) / n
         loss.backward()
 
@@ -380,9 +392,10 @@ def eval_e2e(
     all_preds, all_labels = [], []
     total_loss = 0.0
 
-    for label, frozen_feats, _ in eval_data:
+    for entry in eval_data:
+        label, frozen_feats = entry[0], entry[1]
         y = torch.tensor([label], dtype=torch.long, device=model._device)
-        logits = model.forward_from_frozen(frozen_feats, noise_std=0.0, apply_noise=False)
+        logits = model.forward_from_frozen(frozen_feats)
         total_loss += criterion(logits, y).item()
         all_preds.append(int(logits.argmax(1).item()))
         all_labels.append(label)
@@ -551,7 +564,11 @@ def cross_validate_finetune(
     valid_labels = all_labels[valid_idx]
     valid_groups = groups[valid_idx]
     valid_frozen = [all_frozen[i] for i in valid_idx]
+    valid_specs  = [all_specs[i] for i in valid_idx]
     print(f"\n{len(valid_idx)}/{len(wav_paths)} recordings with valid detections")
+
+    # Frozen backbone for re-encoding augmented spectrograms with noise
+    frozen_end = min(finetune_from, {'x4': 14, 'deep': 19}[ep])
 
     # ── CV loop ──────────────────────────────────────────────────────────────
     sgkf      = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
@@ -568,23 +585,24 @@ def cross_validate_finetune(
         inner_tr  = list(tr_idx[:-n_val])
         inner_val = list(tr_idx[-n_val:])
 
-        train_real = [(int(valid_labels[i]), valid_frozen[i]) for i in inner_tr]
-        val_data   = [(int(valid_labels[i]), valid_frozen[i], False) for i in inner_val]
-        te_data    = [(int(valid_labels[i]), valid_frozen[i], False) for i in te_idx]
+        # Include spec index for input-level augmentation lookup
+        train_real = [(int(valid_labels[i]), valid_frozen[i], i) for i in inner_tr]
+        val_data   = [(int(valid_labels[i]), valid_frozen[i], False, i) for i in inner_val]
+        te_data    = [(int(valid_labels[i]), valid_frozen[i], False, i) for i in te_idx]
 
         # Balance minority class
         if aug_enabled:
             train_data = augment_train_data(train_real, random_seed=seed + fold)
         else:
-            train_data = [(lbl, feats, False) for lbl, feats in train_real]
+            train_data = [(lbl, feats, False, si) for lbl, feats, si in train_real]
 
         cls_counts_aug = {}
-        for lbl, _, _ in train_data:
-            cls_counts_aug[lbl] = cls_counts_aug.get(lbl, 0) + 1
+        for entry in train_data:
+            cls_counts_aug[entry[0]] = cls_counts_aug.get(entry[0], 0) + 1
         print(f"  Train after aug: "
               f"{ {_display.get(k, k): v for k, v in cls_counts_aug.items()} }")
 
-        # Fresh model per fold
+        # Fresh model per fold (with its own backbone copy for unfrozen blocks)
         backbone = load_backbone()
         model = FineTuneUSVModel(
             backbone=backbone,
@@ -595,6 +613,12 @@ def cross_validate_finetune(
             extraction_point=ep,
             device=device_str,
         )
+
+        # Separate frozen backbone for re-encoding noisy spectrograms
+        frozen_backbone = load_backbone().to(device)
+        frozen_backbone.eval()
+        for p in frozen_backbone.parameters():
+            p.requires_grad = False
 
         enc_params = [p for p in model.backbone.parameters() if p.requires_grad]
         cls_params = list(model.classifier.parameters())
@@ -611,14 +635,14 @@ def cross_validate_finetune(
         )
 
         # Class-weighted cross-entropy
-        y_tr    = np.array([lbl for lbl, _, _ in train_data])
+        y_tr    = np.array([entry[0] for entry in train_data])
         counts  = np.bincount(y_tr, minlength=n_classes).astype(float)
         weights = len(y_tr) / (n_classes * np.maximum(counts, 1))
         criterion = nn.CrossEntropyLoss(
             weight=torch.tensor(weights, dtype=torch.float32, device=device)
         )
 
-        # Training loop
+        # Training loop — per-epoch input-level augmentation
         best_loss  = float("inf")
         best_state = None
         stall      = 0
@@ -626,8 +650,14 @@ def cross_validate_finetune(
         n_epochs   = cfg_tr.get("n_epochs", 300)
 
         for ep_num in range(1, n_epochs + 1):
+            rng_ep = np.random.default_rng(seed + fold * 10000 + ep_num)
             tr_loss, tr_acc = train_epoch_e2e(
-                model, train_data, criterion, optimizer, noise_std
+                model, train_data, criterion, optimizer, noise_std,
+                all_specs=valid_specs,
+                frozen_backbone=frozen_backbone,
+                frozen_end=frozen_end,
+                device=device,
+                rng=rng_ep,
             )
             vm = eval_e2e(model, val_data, criterion, n_classes)
             scheduler.step(vm["loss"])
@@ -651,11 +681,12 @@ def cross_validate_finetune(
 
         if best_state:
             model.load_state_dict(best_state)
+        del frozen_backbone  # free memory
 
         # Predict on test fold
         model.eval()
-        for rec_idx, (label, frozen_feats, _) in zip(te_idx, te_data):
-            all_preds[rec_idx] = model.predict_from_frozen(frozen_feats)
+        for rec_idx, entry in zip(te_idx, te_data):
+            all_preds[rec_idx] = model.predict_from_frozen(entry[1])
 
         # Per-fold summary
         fold_mask = all_preds[te_idx] != -1

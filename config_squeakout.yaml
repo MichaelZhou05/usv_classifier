@@ -17,7 +17,7 @@ encoder:
   #   'x3'    →   32-dim  (lightest; comparable to current 11 hand-crafted feats)
   #   'multi' → 1408-dim  (multi-scale, richest but largest input to classifier)
   extraction_point: "x4"
-  device: "cpu"                # set to "cuda" or "mps" if available
+  device: "cuda"               # H200 GPU via scavenger-h200 partition
   batch_size: 16               # spectrograms per forward pass
 
 # ── Spectrogram generation ────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ swe:
   num_slices: 16               # number of random projection directions
   num_ref_points: 16           # resolution of the CDF approximation
   freeze_swe: false            # true = fixed random projections (faster)
-  flatten: true                # output dim = num_slices * num_ref_points
+  flatten: false               # keep (num_slices, num_ref_points) structure
 
 # ── Class-balance augmentation ────────────────────────────────────────────────
 augmentation:

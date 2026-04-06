@@ -13,11 +13,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=usv_detect
+#SBATCH -p scavenger-h200
+#SBATCH -A scavenger-h200
+#SBATCH --gres=gpu:1
 #SBATCH --array=0-999%20         # array indices auto-trimmed to actual file count;
                                   # %20 = run max 20 jobs simultaneously
 #SBATCH --cpus-per-task=2
-#SBATCH --mem=8G
-#SBATCH --time=00:30:00           # 30 min is generous for a 5-min WAV on CPU
+#SBATCH --mem=16G
+#SBATCH --time=00:30:00
 #SBATCH --output=logs/detect_%A_%a.out
 #SBATCH --error=logs/detect_%A_%a.err
 
@@ -63,6 +66,7 @@ python detect_calls.py \
     --audio   "${AUDIO_FILE}" \
     --weights "${SQUEAKOUT_WEIGHTS}" \
     --out_csv "${OUT_CSV}" \
+    --device  cuda \
     --window_sec 0.5 \
     --overlap_sec 0.1 \
     --freq_min 30000 \

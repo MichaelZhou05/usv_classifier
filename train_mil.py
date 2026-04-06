@@ -30,11 +30,14 @@ if 'pytorch_lightning' not in sys.modules:
     sys.modules['pytorch_lightning'] = MagicMock()
 
 from data import LABEL_NAMES
-from data.squeakout_features import SqueakOutEncoder
+from data.squeakout_features import SqueakOutEncoder, add_spectrogram_noise
 from data.spectral_features import (
     extract_recording_spectral_features, N_CALL_FEATURES,
 )
-from train import find_recordings, compute_acoustic_stats, extract_or_load, ProgressLogger
+from train import (
+    find_recordings, compute_acoustic_stats, extract_or_load,
+    extract_or_load_spectrograms, ProgressLogger,
+)
 from models.mil import MILClassifier
 
 
@@ -77,25 +80,43 @@ def load_recording_features(
     return combined.astype(np.float32)
 
 
-def augment_bag(features: np.ndarray, noise_std: float, rng) -> np.ndarray:
-    """Augment a bag of call features with Gaussian noise."""
-    feat_std = np.maximum(features.std(axis=0), 1e-8)
-    noise = rng.normal(0, noise_std, size=features.shape) * feat_std
-    return (features + noise).astype(np.float32)
-
-
 def train_mil_epoch(
-    model, train_data, criterion, optimizer, device, noise_std=0.05, rng=None,
+    model, train_data, criterion, optimizer, device,
+    noise_std=0.05, rng=None, encoder=None, all_specs=None,
+    spec_global_indices=None, cfg_enc=None, spec_feats_all=None,
+    global_mean=None, global_std=None,
 ):
-    """Train one epoch over bags (one recording at a time)."""
+    """
+    Train one epoch over bags (one recording at a time).
+
+    For augmented copies, applies Gaussian noise at the spectrogram level
+    (before SqueakOut encoding) each epoch, producing fresh features.
+    """
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     perm = np.random.permutation(len(train_data))
 
     for idx in perm:
-        label, feats, is_aug = train_data[int(idx)]
-        if is_aug and noise_std > 0 and rng is not None:
-            feats = augment_bag(feats, noise_std, rng)
+        label, feats, is_aug, global_idx = train_data[int(idx)]
+
+        if is_aug and noise_std > 0 and rng is not None and encoder is not None:
+            # Input-level noise: add noise to spectrograms → re-encode
+            specs = all_specs[global_idx]
+            noisy_specs = add_spectrogram_noise(specs, noise_std, rng)
+            enc_feats = encoder.encode_batch(
+                noisy_specs, batch_size=cfg_enc['batch_size']
+            )
+            # Re-combine with spectral features
+            if spec_feats_all is not None:
+                spec_f = spec_feats_all[global_idx]
+                n_calls = min(enc_feats.shape[0], spec_f.shape[0])
+                feats = np.hstack([enc_feats[:n_calls], spec_f[:n_calls]])
+            else:
+                feats = enc_feats
+            feats = feats.astype(np.float32)
+            # Re-normalise
+            if global_mean is not None:
+                feats = (feats - global_mean) / global_std
 
         x = torch.tensor(feats, dtype=torch.float32).to(device)
         y = torch.tensor([label], dtype=torch.long).to(device)
@@ -121,7 +142,8 @@ def eval_mil(model, eval_data, criterion, device, n_classes):
     all_preds, all_labels = [], []
     total_loss = 0.0
 
-    for label, feats, _ in eval_data:
+    for entry in eval_data:
+        label, feats = entry[0], entry[1]
         x = torch.tensor(feats, dtype=torch.float32).to(device)
         y = torch.tensor([label], dtype=torch.long).to(device)
         logits, _ = model(x)
@@ -186,20 +208,62 @@ def cross_validate_mil(config, data_dir, detections_dir, cache_dir=None,
         device=cfg_enc.get("device", "cpu"),
     )
 
-    # Extract all features
-    print("Extracting combined call features...")
-    all_feats = []
+    # Extract all features + spectrograms (for input-level augmentation)
+    print("Extracting combined call features + spectrograms...")
+    all_feats = []        # combined encoder+spectral features per recording
+    all_enc_feats = []    # encoder-only features per recording
+    all_spec_feats = []   # spectral-only features per recording
+    all_specs_raw = []    # raw spectrograms per recording (for input-level noise)
     valid_idx = []
     for i, (wav, csv) in enumerate(zip(wav_paths, csv_paths)):
         feats = load_recording_features(wav, csv, encoder, cache_path, cfg_enc, cfg_spec)
         if feats is not None:
             all_feats.append(feats)
+            # Also load raw spectrograms for per-epoch noise augmentation
+            specs = extract_or_load_spectrograms(
+                wav, csv, cache_path,
+                window_sec=cfg_spec['window_duration_sec'],
+                freq_min=cfg_spec['freq_min'],
+                freq_max=cfg_spec['freq_max'],
+            )
+            all_specs_raw.append(specs)
+            # Load individual feature types for re-combining after noisy re-encoding
+            enc_f = extract_or_load(
+                wav, csv, encoder, cache_path,
+                window_sec=cfg_spec['window_duration_sec'],
+                freq_min=cfg_spec['freq_min'],
+                freq_max=cfg_spec['freq_max'],
+                batch_size=cfg_enc['batch_size'],
+            )
+            all_enc_feats.append(enc_f)
+            # Spectral features (the non-encoder part)
+            spectral_cache = cache_path / "spectral" if cache_path else None
+            if spectral_cache:
+                spectral_cache.mkdir(parents=True, exist_ok=True)
+            spec_cache_file = spectral_cache / f"{wav.stem}__spectral.npy" if spectral_cache else None
+            if spec_cache_file and spec_cache_file.exists():
+                spec_f = np.load(spec_cache_file)
+            else:
+                spec_f = extract_recording_spectral_features(
+                    str(wav), str(csv),
+                    freq_min=cfg_spec['freq_min'],
+                    freq_max=cfg_spec['freq_max'],
+                    n_fft=cfg_spec.get('n_fft', 512),
+                    hop_length=cfg_spec.get('hop_length', 64),
+                )
+                if spec_cache_file:
+                    np.save(spec_cache_file, spec_f)
+            all_spec_feats.append(spec_f)
             valid_idx.append(i)
+        else:
+            all_specs_raw.append(None)
+            all_enc_feats.append(None)
+            all_spec_feats.append(None)
         if (i + 1) % 20 == 0:
             n_calls = feats.shape[0] if feats is not None else 0
             print(f"  [{i+1}/{len(wav_paths)}] {n_calls} calls", flush=True)
 
-    del encoder
+    # Keep encoder loaded for per-epoch re-encoding
     valid_idx = np.array(valid_idx)
     valid_labels = labels[valid_idx]
     valid_groups = groups[valid_idx]
@@ -226,17 +290,21 @@ def cross_validate_mil(config, data_dir, detections_dir, cache_dir=None,
         inner_tr = list(tr_idx[:-n_val])
         inner_val = list(tr_idx[-n_val:])
 
-        # Build data lists
-        train_real = [(int(valid_labels[i]), all_feats[i], False) for i in inner_tr]
-        val_data = [(int(valid_labels[i]), all_feats[i], False) for i in inner_val]
-        te_data = [(int(valid_labels[i]), all_feats[i], False) for i in te_idx]
+        # Build data lists — include global_idx for spectrogram lookup
+        # (label, features, is_augmented, global_valid_idx)
+        train_real = [(int(valid_labels[i]), all_feats[i], False, int(valid_idx[i]))
+                      for i in inner_tr]
+        val_data = [(int(valid_labels[i]), all_feats[i], False, int(valid_idx[i]))
+                    for i in inner_val]
+        te_data = [(int(valid_labels[i]), all_feats[i], False, int(valid_idx[i]))
+                   for i in te_idx]
 
-        # Augment: oversample minority class
+        # Augment: oversample minority class (duplication only, noise applied per-epoch)
         if cfg_aug.get("enabled", True):
             rng = np.random.default_rng(seed + fold)
             class_recs = {}
-            for lbl, feats, _ in train_real:
-                class_recs.setdefault(lbl, []).append(feats)
+            for entry in train_real:
+                class_recs.setdefault(entry[0], []).append(entry)
             target = max(len(v) for v in class_recs.values())
             train_data = list(train_real)
             for lbl, recs in class_recs.items():
@@ -245,13 +313,14 @@ def cross_validate_mil(config, data_dir, detections_dir, cache_dir=None,
                     continue
                 for _ in range(target - n):
                     donor = recs[rng.integers(0, n)]
-                    train_data.append((lbl, donor, True))
+                    # Mark as augmented — per-epoch noise will be applied at input level
+                    train_data.append((lbl, donor[1], True, donor[3]))
         else:
             train_data = train_real
 
         cls_counts = {}
-        for lbl, _, _ in train_data:
-            cls_counts[lbl] = cls_counts.get(lbl, 0) + 1
+        for entry in train_data:
+            cls_counts[entry[0]] = cls_counts.get(entry[0], 0) + 1
         print(f"  Train: {cls_counts}")
 
         # Model — small capacity to combat overfitting on tiny dataset
@@ -264,7 +333,7 @@ def cross_validate_mil(config, data_dir, detections_dir, cache_dir=None,
             dropout=0.5,
         ).to(device)
 
-        y_tr = np.array([lbl for lbl, _, _ in train_data])
+        y_tr = np.array([entry[0] for entry in train_data])
         counts = np.bincount(y_tr, minlength=n_classes).astype(float)
         weights = len(y_tr) / (n_classes * np.maximum(counts, 1))
         criterion = nn.CrossEntropyLoss(
@@ -276,16 +345,19 @@ def cross_validate_mil(config, data_dir, detections_dir, cache_dir=None,
             optimizer, mode="min", factor=0.5, patience=15
         )
 
-        rng_aug = np.random.default_rng(seed + fold + 100)
         noise_std = cfg_aug.get("noise_std", 0.05)
         best_loss, stall, best_state = float("inf"), 0, None
         patience = cfg_tr.get("early_stopping_patience", 40)
         n_epochs = cfg_tr.get("n_epochs", 300)
 
         for ep in range(1, n_epochs + 1):
+            rng_aug = np.random.default_rng(seed + fold + ep * 100)
             tr_loss, tr_acc = train_mil_epoch(
                 model, train_data, criterion, optimizer, device,
                 noise_std=noise_std, rng=rng_aug,
+                encoder=encoder, all_specs=all_specs_raw,
+                cfg_enc=cfg_enc, spec_feats_all=all_spec_feats,
+                global_mean=global_mean, global_std=global_std,
             )
             vm = eval_mil(model, val_data, criterion, device, n_classes)
             scheduler.step(vm["loss"])
@@ -311,8 +383,8 @@ def cross_validate_mil(config, data_dir, detections_dir, cache_dir=None,
         # Predict test fold
         model.eval()
         with torch.no_grad():
-            for rec_idx, (label, feats, _) in zip(te_idx, te_data):
-                x = torch.tensor(feats, dtype=torch.float32).to(device)
+            for rec_idx, entry in zip(te_idx, te_data):
+                x = torch.tensor(entry[1], dtype=torch.float32).to(device)
                 logits, _ = model(x)
                 all_preds[rec_idx] = int(logits.argmax(1).item())
 

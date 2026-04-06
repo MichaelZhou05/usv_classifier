@@ -73,6 +73,8 @@ import yaml
 from data import (
     SqueakOutEncoder,
     extract_recording_features,
+    extract_recording_spectrograms,
+    add_spectrogram_noise,
     augment_recordings_to_balance,
     augment_by_cross_litter_mixing,
     infer_label_from_filename,
@@ -213,6 +215,41 @@ def extract_or_load(
         np.save(cache_path, feats)
 
     return feats
+
+
+def extract_or_load_spectrograms(
+    wav_path: Path,
+    csv_path: Path,
+    cache_dir: Path | None,
+    window_sec: float,
+    freq_min: int,
+    freq_max: int,
+) -> list[np.ndarray]:
+    """
+    Return list of (512, 512) spectrograms for one recording, with disk caching.
+    """
+    if cache_dir is not None:
+        spec_cache = cache_dir / "spectrograms"
+        spec_cache.mkdir(parents=True, exist_ok=True)
+        cache_path = spec_cache / f"{wav_path.stem}__specs.npy"
+        if cache_path.exists():
+            arr = np.load(cache_path)
+            return list(arr)
+
+    specs = extract_recording_spectrograms(
+        str(wav_path), str(csv_path),
+        window_duration_sec=window_sec,
+        freq_min=freq_min,
+        freq_max=freq_max,
+    )
+
+    if cache_dir is not None and specs:
+        spec_cache = cache_dir / "spectrograms"
+        spec_cache.mkdir(parents=True, exist_ok=True)
+        cache_path = spec_cache / f"{wav_path.stem}__specs.npy"
+        np.save(cache_path, np.stack(specs).astype(np.float32))
+
+    return specs
 
 
 def extract_split_features(
@@ -440,48 +477,103 @@ def train(config: dict, data_dir: str, detections_dir: str,
     pooler = PoolerRegistry.get(pooler_name, **pooler_kwargs)
     print(f"  Pooler: {pooler}")
 
-    # ── 5. Extract features per split ─────────────────────────────────────────
+    # ── 5. Extract features + spectrograms for training split ──────────────
     plog.log("Extracting features (cached recordings will load instantly)...")
     print("\nExtracting features...")
 
-    def _extract(idx, augment=False, label=""):
+    cache_path = Path(cache_dir) if cache_dir else None
+
+    # Training: extract clean features AND raw spectrograms (for per-epoch noise)
+    train_recording_data = []  # [(label, clean_features, spectrograms)]
+    tr_w, tr_c, tr_l = subset(train_idx)
+    print(f"  train ({len(tr_w)} recordings)...")
+    for wav, csv, label in zip(tr_w, tr_c, tr_l):
+        feats = extract_or_load(
+            wav, csv, encoder, cache_path,
+            window_sec=cfg_spec['window_duration_sec'],
+            freq_min=cfg_spec['freq_min'],
+            freq_max=cfg_spec['freq_max'],
+            batch_size=cfg_enc['batch_size'],
+        )
+        if feats.shape[0] == 0:
+            print(f"  Warning: no calls in {wav.name}, skipping")
+            continue
+        specs = extract_or_load_spectrograms(
+            wav, csv, cache_path,
+            window_sec=cfg_spec['window_duration_sec'],
+            freq_min=cfg_spec['freq_min'],
+            freq_max=cfg_spec['freq_max'],
+        )
+        train_recording_data.append((int(label), feats, specs))
+
+    # Val/test: features only (no augmentation needed)
+    def _extract_no_aug(idx, label=""):
         w, c, l = subset(idx)
         print(f"  {label} ({len(w)} recordings)...")
         meta, _ = extract_split_features(
             w, c, l, encoder,
-            cache_dir=Path(cache_dir) if cache_dir else None,
+            cache_dir=cache_path,
             cfg_enc=cfg_enc, cfg_spec=cfg_spec,
-            augment=augment,
-            noise_std=cfg_aug.get("noise_std", 0.05),
-            random_seed=cfg_spl.get("random_seed", seed),
+            augment=False,
         )
         return meta
 
-    train_meta = _extract(train_idx, augment=cfg_aug.get("enabled", True), label="train")
-    val_meta   = _extract(val_idx,   augment=False, label="val")
-    test_meta  = _extract(test_idx,  augment=False, label="test")
+    val_meta   = _extract_no_aug(val_idx,  label="val")
+    test_meta  = _extract_no_aug(test_idx, label="test")
 
-    # ── 6. Pool recordings ────────────────────────────────────────────────────
-    print("\nPooling features...")
-    X_train, y_train = pool_recordings(train_meta, pooler)
-    X_val,   y_val   = pool_recordings(val_meta,   pooler)
-    X_test,  y_test  = pool_recordings(test_meta,  pooler)
+    # ── 6. Balance training classes (duplication only, no noise) ───────────────
+    aug_enabled = cfg_aug.get("enabled", True)
+    noise_std   = cfg_aug.get("noise_std", 0.05)
+    rng_balance = np.random.default_rng(cfg_spl.get("random_seed", seed))
 
-    # ── 7. Normalise (fit on train only) ──────────────────────────────────────
-    feat_mean = X_train.mean(axis=0)
-    feat_std  = np.maximum(X_train.std(axis=0), 1e-8)
-    X_train = (X_train - feat_mean) / feat_std
-    X_val   = (X_val   - feat_mean) / feat_std
-    X_test  = (X_test  - feat_mean) / feat_std
+    # Build balanced index: [(src_idx_into_train_recording_data, is_augmented)]
+    balanced_indices: list[tuple[int, bool]] = []
+    if aug_enabled:
+        class_indices: dict[int, list[int]] = {}
+        for i, (lbl, _, _) in enumerate(train_recording_data):
+            class_indices.setdefault(lbl, []).append(i)
+        target_count = max(len(idxs) for idxs in class_indices.values())
 
-    plog.log(f"Features : {X_train.shape[1]}-dim | "
-             f"train={X_train.shape[0]}, val={X_val.shape[0]}, test={X_test.shape[0]}")
-    print(f"\nFeature shape: {X_train.shape[1]}-dim")
-    print(f"Train: {X_train.shape[0]} samples  Val: {X_val.shape[0]}  Test: {X_test.shape[0]}")
+        for i in range(len(train_recording_data)):
+            balanced_indices.append((i, False))
+        for lbl, idxs in class_indices.items():
+            n = len(idxs)
+            if n >= target_count:
+                continue
+            for _ in range(target_count - n):
+                donor = idxs[rng_balance.integers(0, n)]
+                balanced_indices.append((donor, True))
+    else:
+        balanced_indices = [(i, False) for i in range(len(train_recording_data))]
+
+    n_real = sum(1 for _, aug in balanced_indices if not aug)
+    n_aug  = sum(1 for _, aug in balanced_indices if aug)
+    plog.log(f"Training : {n_real} real + {n_aug} augmented recordings "
+             f"(input-level noise, noise_std={noise_std})")
+    print(f"  Balanced: {n_real} real + {n_aug} augmented (input-level noise per epoch)")
+
+    # ── 7. Pool & normalise val/test (fixed, no augmentation) ─────────────────
+    print("\nPooling val/test features...")
+    X_val,  y_val  = pool_recordings(val_meta,  pooler)
+    X_test, y_test = pool_recordings(test_meta, pooler)
+
+    # Normalisation stats from clean (real) training recordings only
+    clean_meta = [(lbl, list(feats)) for lbl, feats, _ in train_recording_data]
+    X_train_clean, _ = pool_recordings(clean_meta, pooler)
+    feat_mean = X_train_clean.mean(axis=0)
+    feat_std  = np.maximum(X_train_clean.std(axis=0), 1e-8)
+
+    X_val  = (X_val  - feat_mean) / feat_std
+    X_test = (X_test - feat_mean) / feat_std
+
+    plog.log(f"Features : {X_val.shape[1]}-dim | "
+             f"train={len(balanced_indices)}, val={X_val.shape[0]}, test={X_test.shape[0]}")
+    print(f"\nFeature shape: {X_val.shape[1]}-dim")
+    print(f"Train: {len(balanced_indices)} samples  Val: {X_val.shape[0]}  Test: {X_test.shape[0]}")
 
     # ── 8. Build model ────────────────────────────────────────────────────────
     cfg_model = config.get("model", {})
-    input_dim = X_train.shape[1]
+    input_dim = X_val.shape[1]
     model = get_model(
         "enriched",
         input_dim=input_dim,
@@ -493,9 +585,10 @@ def train(config: dict, data_dir: str, detections_dir: str,
     print(f"\nModel:\n{model}")
 
     # ── 9. Loss with class weights ─────────────────────────────────────────────
+    y_train_balanced = np.array([train_recording_data[si][0] for si, _ in balanced_indices])
     if cfg_model.get("use_class_weights", True):
-        counts = np.bincount(y_train, minlength=n_classes).astype(float)
-        weights = len(y_train) / (n_classes * np.maximum(counts, 1))
+        counts = np.bincount(y_train_balanced, minlength=n_classes).astype(float)
+        weights = len(y_train_balanced) / (n_classes * np.maximum(counts, 1))
         class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
         print(f"Class weights: {weights.round(3)}")
         criterion = nn.CrossEntropyLoss(weight=class_weights)
@@ -504,7 +597,6 @@ def train(config: dict, data_dir: str, detections_dir: str,
 
     # ── 10. Optimiser + scheduler ─────────────────────────────────────────────
     batch_size = cfg_tr.get("batch_size", 8)
-    train_loader = make_loader(X_train, y_train, batch_size, shuffle=True)
     val_loader   = make_loader(X_val,   y_val,   batch_size, shuffle=False)
     test_loader  = make_loader(X_test,  y_test,  batch_size, shuffle=False)
 
@@ -517,7 +609,7 @@ def train(config: dict, data_dir: str, detections_dir: str,
         optimizer, mode="min", factor=0.5, patience=10
     )
 
-    # ── 11. Training loop ──────────────────────────────────────────────────────
+    # ── 11. Training loop (per-epoch input-level augmentation) ─────────────────
     n_epochs  = cfg_tr.get("n_epochs", 300)
     patience  = cfg_tr.get("early_stopping_patience", 40)
     best_loss = float("inf")
@@ -529,6 +621,24 @@ def train(config: dict, data_dir: str, detections_dir: str,
     print("-" * 65)
 
     for ep in range(1, n_epochs + 1):
+        # Re-encode augmented recordings with fresh noise each epoch
+        rng_ep = np.random.default_rng(seed + ep)
+        epoch_meta: list[tuple[int, list[np.ndarray]]] = []
+        for src_idx, is_aug in balanced_indices:
+            label, clean_feats, specs = train_recording_data[src_idx]
+            if is_aug:
+                noisy_specs = add_spectrogram_noise(specs, noise_std, rng_ep)
+                noisy_feats = encoder.encode_batch(
+                    noisy_specs, batch_size=cfg_enc['batch_size']
+                )
+                epoch_meta.append((label, list(noisy_feats)))
+            else:
+                epoch_meta.append((label, list(clean_feats)))
+
+        X_train_ep, y_train_ep = pool_recordings(epoch_meta, pooler)
+        X_train_ep = (X_train_ep - feat_mean) / feat_std
+        train_loader = make_loader(X_train_ep, y_train_ep, batch_size, shuffle=True)
+
         tr_loss, tr_acc = train_epoch(model, train_loader, criterion, optimizer, device)
         val_m = evaluate(model, val_loader, criterion, device, n_classes)
         scheduler.step(val_m["loss"])
@@ -670,6 +780,38 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
     pooler_name   = config.get("pooler", "average")
     pooler_kwargs = {"n_features": encoder.output_dim}
 
+    # ── Extract features + spectrograms for all recordings ─────────────────
+    cache_path = Path(cache_dir) if cache_dir else None
+    noise_std  = cfg_aug.get("noise_std", 0.05)
+    aug_enabled = cfg_aug.get("enabled", True)
+
+    print("Extracting features + spectrograms for all recordings...")
+    all_feats = []   # per-recording: np.ndarray (n_calls, dim)
+    all_specs = []   # per-recording: list of (512, 512) spectrograms
+    all_valid = []   # indices into original wav_paths that have valid calls
+
+    for i, (wav, csv) in enumerate(zip(wav_paths, csv_paths)):
+        feats = extract_or_load(
+            wav, csv, encoder, cache_path,
+            window_sec=cfg_spec['window_duration_sec'],
+            freq_min=cfg_spec['freq_min'],
+            freq_max=cfg_spec['freq_max'],
+            batch_size=cfg_enc['batch_size'],
+        )
+        if feats.shape[0] == 0:
+            all_feats.append(None)
+            all_specs.append(None)
+            continue
+        specs = extract_or_load_spectrograms(
+            wav, csv, cache_path,
+            window_sec=cfg_spec['window_duration_sec'],
+            freq_min=cfg_spec['freq_min'],
+            freq_max=cfg_spec['freq_max'],
+        )
+        all_feats.append(feats)
+        all_specs.append(specs)
+        all_valid.append(i)
+
     sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     all_true = np.array(labels, dtype=np.int64)
     preds_svm = np.full(len(labels), -1, dtype=np.int64)
@@ -685,55 +827,50 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
 
         # Use last ~15% of train fold as val for MLP early stopping
         n_val = max(1, int(0.15 * len(tr_idx)))
-        inner_tr = list(tr_idx[:-n_val])
-        inner_val = list(tr_idx[-n_val:])
+        inner_tr = [i for i in tr_idx[:-n_val] if all_feats[i] is not None]
+        inner_val = [i for i in tr_idx[-n_val:] if all_feats[i] is not None]
+        te_valid = [i for i in te_idx if all_feats[i] is not None]
 
-        def _get_meta(idx_list):
-            """Extract real (un-augmented) recording_meta for a set of indices."""
-            w = [wav_paths[i] for i in idx_list]
-            c = [csv_paths[i] for i in idx_list]
-            l = all_true[idx_list]
-            meta, _ = extract_split_features(
-                w, c, l, encoder,
-                cache_dir=Path(cache_dir) if cache_dir else None,
-                cfg_enc=cfg_enc, cfg_spec=cfg_spec,
-                augment=False,
-                noise_std=cfg_aug.get("noise_std", 0.05),
-                random_seed=seed,
-            )
-            return meta
+        # Build balanced indices for training: [(global_idx, is_augmented)]
+        balanced_tr: list[tuple[int, bool]] = [(i, False) for i in inner_tr]
+        if aug_enabled:
+            rng_bal = np.random.default_rng(seed + fold)
+            class_indices: dict[int, list[int]] = {}
+            for i in inner_tr:
+                class_indices.setdefault(int(all_true[i]), []).append(i)
+            target_count = max(len(idxs) for idxs in class_indices.values())
+            for lbl, idxs in class_indices.items():
+                n = len(idxs)
+                if n >= target_count:
+                    continue
+                for _ in range(target_count - n):
+                    donor = idxs[rng_bal.integers(0, n)]
+                    balanced_tr.append((donor, True))
 
-        meta_tr = _get_meta(inner_tr)
-        if cfg_aug.get("enabled", True):
-            strategy = cfg_aug.get("strategy", "mixing")
-            if strategy == "mixing":
-                meta_tr = augment_by_cross_litter_mixing(
-                    meta_tr,
-                    n_sources=cfg_aug.get("n_sources", 2),
-                    target_multiplier=cfg_aug.get("target_multiplier", 1.0),
-                    random_seed=seed,
+        # Encode augmented copies once with input-level noise (for SVM/RF)
+        rng_fold = np.random.default_rng(seed + fold + 1000)
+        meta_tr: list[tuple[int, list[np.ndarray]]] = []
+        for gi, is_aug in balanced_tr:
+            label = int(all_true[gi])
+            if is_aug:
+                noisy_specs = add_spectrogram_noise(all_specs[gi], noise_std, rng_fold)
+                noisy_feats = encoder.encode_batch(
+                    noisy_specs, batch_size=cfg_enc['batch_size']
                 )
+                meta_tr.append((label, list(noisy_feats)))
             else:
-                meta_tr = augment_recordings_to_balance(
-                    meta_tr,
-                    noise_std=cfg_aug.get("noise_std", 0.05),
-                    random_seed=seed,
-                )
+                meta_tr.append((label, list(all_feats[gi])))
 
-        X_tr,  y_tr  = pool_recordings(meta_tr, pooler)
-        X_val, y_val = pool_recordings(_get_meta(inner_val),    pooler)
-        X_te,  y_te  = pool_recordings(_get_meta(list(te_idx)), pooler)
+        meta_val = [(int(all_true[i]), list(all_feats[i])) for i in inner_val]
+        meta_te  = [(int(all_true[i]), list(all_feats[i])) for i in te_valid]
+
+        X_tr,  y_tr  = pool_recordings(meta_tr,  pooler)
+        X_val, y_val = pool_recordings(meta_val, pooler)
+        X_te,  y_te  = pool_recordings(meta_te,  pooler)
 
         # ── Acoustic summary features ─────────────────────────────────────────
-        # Real rows: use per-recording stats from CSV.
-        # Synthetic rows (appended by augmentation): impute per-class mean of
-        # the real training acoustic stats.
-        valid_tr  = [i for i in inner_tr   if valid_mask[i]]
-        valid_val = [i for i in inner_val  if valid_mask[i]]
-        valid_te  = [i for i in list(te_idx) if valid_mask[i]]
-
-        acous_real_tr = acous_all[valid_tr]                # (n_orig_tr, 8)
-        n_orig_tr     = len(valid_tr)
+        acous_real_tr = acous_all[inner_tr]
+        n_orig_tr     = len(inner_tr)
         n_synth       = len(y_tr) - n_orig_tr
         if n_synth > 0:
             cls_mean = {cls: acous_real_tr[y_tr[:n_orig_tr] == cls].mean(0)
@@ -743,8 +880,8 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
         else:
             acous_tr = acous_real_tr
 
-        acous_val = acous_all[valid_val]
-        acous_te  = acous_all[valid_te]
+        acous_val = acous_all[inner_val]
+        acous_te  = acous_all[te_valid]
 
         X_tr  = np.hstack([X_tr,  acous_tr])
         X_val = np.hstack([X_val, acous_val])
@@ -752,12 +889,12 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
 
         mean = X_tr.mean(0)
         std  = np.maximum(X_tr.std(0), 1e-8)
-        X_tr  = (X_tr  - mean) / std
         X_val = (X_val - mean) / std
         X_te  = (X_te  - mean) / std
 
-        # Combine train+val for sklearn (no need to hold out val)
-        X_sk = np.vstack([X_tr, X_val])
+        # SVM/RF use the single-noise training set
+        X_tr_norm = (X_tr - mean) / std
+        X_sk = np.vstack([X_tr_norm, X_val])
         y_sk = np.concatenate([y_tr, y_val])
 
         svm = SVC(kernel='rbf', class_weight='balanced', C=1.0, gamma='scale')
@@ -769,7 +906,7 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
         rf.fit(X_sk, y_sk)
         preds_rf[te_idx[:len(y_te)]] = rf.predict(X_te)
 
-        # MLP per fold
+        # MLP per fold — per-epoch input-level augmentation
         counts  = np.bincount(y_tr, minlength=n_classes).astype(float)
         weights = len(y_tr) / (n_classes * np.maximum(counts, 1))
         crit    = nn.CrossEntropyLoss(
@@ -784,12 +921,30 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
         opt = torch.optim.Adam(model.parameters(),
                                lr=cfg_tr.get("learning_rate", 1e-3),
                                weight_decay=cfg_tr.get("weight_decay", 1e-4))
-        tr_loader  = make_loader(X_tr,  y_tr,  cfg_tr.get("batch_size", 8), shuffle=True)
         val_loader = make_loader(X_val, y_val, cfg_tr.get("batch_size", 8), shuffle=False)
 
         best_loss, stall, best_state = float("inf"), 0, None
         patience = cfg_tr.get("early_stopping_patience", 40)
         for ep in range(1, cfg_tr.get("n_epochs", 300) + 1):
+            # Re-encode augmented copies with fresh noise each epoch
+            rng_ep = np.random.default_rng(seed + fold * 10000 + ep)
+            ep_meta: list[tuple[int, list[np.ndarray]]] = []
+            for gi, is_aug in balanced_tr:
+                label = int(all_true[gi])
+                if is_aug:
+                    noisy_specs = add_spectrogram_noise(all_specs[gi], noise_std, rng_ep)
+                    noisy_feats = encoder.encode_batch(
+                        noisy_specs, batch_size=cfg_enc['batch_size']
+                    )
+                    ep_meta.append((label, list(noisy_feats)))
+                else:
+                    ep_meta.append((label, list(all_feats[gi])))
+
+            X_tr_ep, y_tr_ep = pool_recordings(ep_meta, pooler)
+            X_tr_ep = np.hstack([X_tr_ep, acous_tr])
+            X_tr_ep = (X_tr_ep - mean) / std
+            tr_loader = make_loader(X_tr_ep, y_tr_ep, cfg_tr.get("batch_size", 8), shuffle=True)
+
             train_epoch(model, tr_loader, crit, opt, device)
             vm = evaluate(model, val_loader, crit, device, n_classes)
             if vm["loss"] < best_loss:
