@@ -34,6 +34,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import os
 import sys
 from datetime import datetime
@@ -322,8 +323,24 @@ def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int,
         torch.tensor(X, dtype=torch.float32),
         torch.tensor(y, dtype=torch.long),
     )
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
-                      drop_last=shuffle)  # drop last batch when training to avoid size-1 batches with BatchNorm
+    if len(dataset) == 0:
+        raise ValueError("Cannot create DataLoader from an empty dataset.")
+
+    effective_batch_size = min(batch_size, len(dataset))
+    # Avoid dropping the only batch when the configured batch size is larger
+    # than the fold's training set. Still skip a trailing size-1 batch when
+    # shuffling and there is at least one full batch before it.
+    drop_last = (
+        shuffle
+        and len(dataset) > effective_batch_size
+        and len(dataset) % effective_batch_size == 1
+    )
+    return DataLoader(
+        dataset,
+        batch_size=effective_batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+    )
 
 
 def train_epoch(model, loader, criterion, optimizer, device):
@@ -339,6 +356,8 @@ def train_epoch(model, loader, criterion, optimizer, device):
         total_loss += loss.item() * X.size(0)
         correct += (logits.argmax(1) == y).sum().item()
         total += X.size(0)
+    if total == 0:
+        raise ValueError("Training loader produced zero samples for this epoch.")
     return total_loss / total, correct / total
 
 
@@ -847,35 +866,18 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
                     donor = idxs[rng_bal.integers(0, n)]
                     balanced_tr.append((donor, True))
 
-        # Encode augmented copies once with input-level noise (for SVM/RF)
-        rng_fold = np.random.default_rng(seed + fold + 1000)
-        meta_tr: list[tuple[int, list[np.ndarray]]] = []
-        for gi, is_aug in balanced_tr:
-            label = int(all_true[gi])
-            if is_aug:
-                noisy_specs = add_spectrogram_noise(all_specs[gi], noise_std, rng_fold)
-                noisy_feats = encoder.encode_batch(
-                    noisy_specs, batch_size=cfg_enc['batch_size']
-                )
-                meta_tr.append((label, list(noisy_feats)))
-            else:
-                meta_tr.append((label, list(all_feats[gi])))
-
         meta_val = [(int(all_true[i]), list(all_feats[i])) for i in inner_val]
         meta_te  = [(int(all_true[i]), list(all_feats[i])) for i in te_valid]
 
-        X_tr,  y_tr  = pool_recordings(meta_tr,  pooler)
-        X_val, y_val = pool_recordings(meta_val, pooler)
-        X_te,  y_te  = pool_recordings(meta_te,  pooler)
-
         # ── Acoustic summary features ─────────────────────────────────────────
         acous_real_tr = acous_all[inner_tr]
+        train_label_template = np.array([int(all_true[i]) for i, _ in balanced_tr], dtype=np.int64)
         n_orig_tr     = len(inner_tr)
-        n_synth       = len(y_tr) - n_orig_tr
+        n_synth       = len(train_label_template) - n_orig_tr
         if n_synth > 0:
-            cls_mean = {cls: acous_real_tr[y_tr[:n_orig_tr] == cls].mean(0)
-                        for cls in np.unique(y_tr[:n_orig_tr])}
-            synth_rows = np.array([cls_mean[lbl] for lbl in y_tr[n_orig_tr:]])
+            cls_mean = {cls: acous_real_tr[np.array([int(all_true[i]) for i in inner_tr]) == cls].mean(0)
+                        for cls in np.unique(np.array([int(all_true[i]) for i in inner_tr]))}
+            synth_rows = np.array([cls_mean[lbl] for lbl in train_label_template[n_orig_tr:]])
             acous_tr = np.vstack([acous_real_tr, synth_rows])
         else:
             acous_tr = acous_real_tr
@@ -883,37 +885,19 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
         acous_val = acous_all[inner_val]
         acous_te  = acous_all[te_valid]
 
-        X_tr  = np.hstack([X_tr,  acous_tr])
-        X_val = np.hstack([X_val, acous_val])
-        X_te  = np.hstack([X_te,  acous_te])
-
-        mean = X_tr.mean(0)
-        std  = np.maximum(X_tr.std(0), 1e-8)
-        X_val = (X_val - mean) / std
-        X_te  = (X_te  - mean) / std
-
-        # SVM/RF use the single-noise training set
-        X_tr_norm = (X_tr - mean) / std
-        X_sk = np.vstack([X_tr_norm, X_val])
-        y_sk = np.concatenate([y_tr, y_val])
-
-        svm = SVC(kernel='rbf', class_weight='balanced', C=1.0, gamma='scale')
-        svm.fit(X_sk, y_sk)
-        preds_svm[te_idx[:len(y_te)]] = svm.predict(X_te)
-
-        rf = RandomForestClassifier(n_estimators=200, class_weight='balanced',
-                                    random_state=seed)
-        rf.fit(X_sk, y_sk)
-        preds_rf[te_idx[:len(y_te)]] = rf.predict(X_te)
+        X_val_raw, y_val = pool_recordings(meta_val, pooler)
+        X_te_raw,  y_te  = pool_recordings(meta_te,  pooler)
+        X_val_raw = np.hstack([X_val_raw, acous_val])
+        X_te_raw  = np.hstack([X_te_raw,  acous_te])
 
         # MLP per fold — per-epoch input-level augmentation
-        counts  = np.bincount(y_tr, minlength=n_classes).astype(float)
-        weights = len(y_tr) / (n_classes * np.maximum(counts, 1))
+        counts  = np.bincount(train_label_template, minlength=n_classes).astype(float)
+        weights = len(train_label_template) / (n_classes * np.maximum(counts, 1))
         crit    = nn.CrossEntropyLoss(
             weight=torch.tensor(weights, dtype=torch.float32).to(device)
         )
         model = get_model(
-            "enriched", input_dim=X_tr.shape[1], n_classes=n_classes,
+            "enriched", input_dim=X_val_raw.shape[1], n_classes=n_classes,
             hidden_dims=cfg_model.get("hidden_dims", [64]),
             dropout=cfg_model.get("dropout", 0.2),
             use_batch_norm=False,
@@ -921,9 +905,14 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
         opt = torch.optim.Adam(model.parameters(),
                                lr=cfg_tr.get("learning_rate", 1e-3),
                                weight_decay=cfg_tr.get("weight_decay", 1e-4))
-        val_loader = make_loader(X_val, y_val, cfg_tr.get("batch_size", 8), shuffle=False)
 
-        best_loss, stall, best_state = float("inf"), 0, None
+        best_svm_score, best_rf_score = -np.inf, -np.inf
+        best_svm, best_rf = None, None
+        best_svm_norm, best_rf_norm = None, None
+        stall_svm, stall_rf = 0, 0
+
+        best_loss, stall_mlp, best_state = float("inf"), 0, None
+        best_mlp_norm = None
         patience = cfg_tr.get("early_stopping_patience", 40)
         for ep in range(1, cfg_tr.get("n_epochs", 300) + 1):
             # Re-encode augmented copies with fresh noise each epoch
@@ -940,23 +929,69 @@ def cross_validate(config: dict, data_dir: str, detections_dir: str,
                 else:
                     ep_meta.append((label, list(all_feats[gi])))
 
-            X_tr_ep, y_tr_ep = pool_recordings(ep_meta, pooler)
-            X_tr_ep = np.hstack([X_tr_ep, acous_tr])
-            X_tr_ep = (X_tr_ep - mean) / std
+            X_tr_ep_raw, y_tr_ep = pool_recordings(ep_meta, pooler)
+            X_tr_ep_raw = np.hstack([X_tr_ep_raw, acous_tr])
+            mean = X_tr_ep_raw.mean(0)
+            std  = np.maximum(X_tr_ep_raw.std(0), 1e-8)
+            X_tr_ep = (X_tr_ep_raw - mean) / std
+            X_val = (X_val_raw - mean) / std
+
+            if aug_enabled or ep == 1:
+                svm = SVC(kernel='rbf', class_weight='balanced', C=1.0, gamma='scale')
+                svm.fit(X_tr_ep, y_tr_ep)
+                svm_val_pred = svm.predict(X_val)
+                svm_score = sk_f1(y_val, svm_val_pred, average='macro', zero_division=0)
+                if svm_score > best_svm_score:
+                    best_svm_score = svm_score
+                    best_svm = deepcopy(svm)
+                    best_svm_norm = (mean.copy(), std.copy())
+                    stall_svm = 0
+                else:
+                    stall_svm += 1
+
+                rf = RandomForestClassifier(
+                    n_estimators=200,
+                    class_weight='balanced',
+                    random_state=seed + fold * 10000 + ep,
+                )
+                rf.fit(X_tr_ep, y_tr_ep)
+                rf_val_pred = rf.predict(X_val)
+                rf_score = sk_f1(y_val, rf_val_pred, average='macro', zero_division=0)
+                if rf_score > best_rf_score:
+                    best_rf_score = rf_score
+                    best_rf = deepcopy(rf)
+                    best_rf_norm = (mean.copy(), std.copy())
+                    stall_rf = 0
+                else:
+                    stall_rf += 1
+
             tr_loader = make_loader(X_tr_ep, y_tr_ep, cfg_tr.get("batch_size", 8), shuffle=True)
+            val_loader = make_loader(X_val, y_val, cfg_tr.get("batch_size", 8), shuffle=False)
 
             train_epoch(model, tr_loader, crit, opt, device)
             vm = evaluate(model, val_loader, crit, device, n_classes)
             if vm["loss"] < best_loss:
                 best_loss = vm["loss"]
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
-                stall = 0
+                best_mlp_norm = (mean.copy(), std.copy())
+                stall_mlp = 0
             else:
-                stall += 1
-                if stall >= patience:
-                    break
+                stall_mlp += 1
+            if stall_svm >= patience and stall_rf >= patience and stall_mlp >= patience:
+                break
+
+        if best_svm is None or best_rf is None or best_mlp_norm is None:
+            raise RuntimeError(f"Fold {fold + 1}: training did not produce valid model state")
+
+        svm_mean, svm_std = best_svm_norm
+        rf_mean, rf_std = best_rf_norm
+        preds_svm[te_idx[:len(y_te)]] = best_svm.predict((X_te_raw - svm_mean) / svm_std)
+        preds_rf[te_idx[:len(y_te)]] = best_rf.predict((X_te_raw - rf_mean) / rf_std)
+
         if best_state:
             model.load_state_dict(best_state)
+        mlp_mean, mlp_std = best_mlp_norm
+        X_te = (X_te_raw - mlp_mean) / mlp_std
         te_loader = make_loader(X_te, y_te, cfg_tr.get("batch_size", 8), shuffle=False)
         tm = evaluate(model, te_loader, crit, device, n_classes)
         preds_mlp[te_idx[:len(y_te)]] = tm["preds"]

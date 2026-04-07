@@ -195,13 +195,20 @@ class SqueakOutEncoder(nn.Module):
                 f"got '{extraction_point}'"
             )
         self.extraction_point = extraction_point
-        self.device = torch.device(device)
+        requested_device = torch.device(device)
+        if requested_device.type == "cuda" and not torch.cuda.is_available():
+            print(
+                "Warning: CUDA was requested for SqueakOutEncoder but is not "
+                "available. Falling back to CPU."
+            )
+            requested_device = torch.device("cpu")
+        self.device = requested_device
 
         # Load directly into SqueakOut (bare nn.Module) — no Lightning needed.
         # Checkpoint was saved by SqueakOut_autoencoder (self.model = SqueakOut()),
         # so state dict keys are prefixed with 'model.'; strip that prefix.
         squeakout = SqueakOut()
-        ckpt = torch.load(weights_path, map_location=device)
+        ckpt = torch.load(weights_path, map_location=self.device)
         state = {k.removeprefix('model.'): v for k, v in ckpt['state_dict'].items()}
         squeakout.load_state_dict(state)
 

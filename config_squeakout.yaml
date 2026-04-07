@@ -17,8 +17,8 @@ encoder:
   #   'x3'    →   32-dim  (lightest; comparable to current 11 hand-crafted feats)
   #   'multi' → 1408-dim  (multi-scale, richest but largest input to classifier)
   extraction_point: "x4"
-  device: "cuda"               # H200 GPU via scavenger-h200 partition
-  batch_size: 16               # spectrograms per forward pass
+  device: "cuda"               # scavenger-gpu job; falls back to CPU if CUDA is unavailable
+  batch_size: 16               # stable for 79-80 recordings and matches prior successful runs
 
 # ── Spectrogram generation ────────────────────────────────────────────────────
 spectrogram:
@@ -75,7 +75,7 @@ model:
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
   n_epochs: 300
-  batch_size: 8
+  batch_size: 8                # small folds need multiple batches; avoids degenerate full-batch training
   learning_rate: 0.001
   weight_decay: 0.0001
   early_stopping_patience: 40

@@ -149,6 +149,153 @@ def extract_call_features(
     ], dtype=np.float32)
 
 
+def extract_call_features_from_spectrogram(
+    spectrogram: np.ndarray,
+    duration_sec: float,
+    freq_min: int = 30_000,
+    freq_max: int = 130_000,
+) -> np.ndarray:
+    """
+    Approximate the hand-crafted call features directly from a spectrogram image.
+
+    This is used for per-epoch Gaussian augmentation, where noise is added after
+    spectrogram generation. Recomputing features from the noised spectrogram
+    keeps the non-encoder feature branches in sync with the augmented input.
+    """
+    if spectrogram.ndim != 2 or 0 in spectrogram.shape:
+        return np.zeros(N_CALL_FEATURES, dtype=np.float32)
+
+    S = np.clip(np.asarray(spectrogram, dtype=np.float32), 0.0, 1.0)
+    power = S ** 2 + 1e-12
+    freqs = np.linspace(freq_min, freq_max, num=S.shape[0], dtype=np.float32)
+    power_sum = power.sum(axis=0) + 1e-12
+
+    freq_trajectory = (power * freqs[:, None]).sum(axis=0) / power_sum
+    freq_center = float(np.mean(freq_trajectory))
+    freq_min_val = float(np.min(freq_trajectory))
+    freq_max_val = float(np.max(freq_trajectory))
+    freq_bw = freq_max_val - freq_min_val
+
+    n_frames = len(freq_trajectory)
+    if n_frames >= 3:
+        t = np.arange(n_frames, dtype=np.float32)
+        coeffs = np.polyfit(t, freq_trajectory, 1)
+        fm_slope = float(coeffs[0])
+        coeffs2 = np.polyfit(t, freq_trajectory, 2)
+        fm_curvature = float(coeffs2[0])
+    elif n_frames == 2:
+        fm_slope = float(freq_trajectory[1] - freq_trajectory[0])
+        fm_curvature = 0.0
+    else:
+        fm_slope = 0.0
+        fm_curvature = 0.0
+
+    mean_power_per_bin = power.mean(axis=1) + 1e-12
+    total_power = float(mean_power_per_bin.sum())
+    spec_centroid = float((mean_power_per_bin * freqs).sum() / max(total_power, 1e-12))
+    spec_bandwidth = float(np.sqrt(
+        ((freqs - spec_centroid) ** 2 * mean_power_per_bin).sum() / max(total_power, 1e-12)
+    ))
+    geo_mean = np.exp(np.mean(np.log(mean_power_per_bin)))
+    arith_mean = float(np.mean(mean_power_per_bin))
+    spec_flatness = float(geo_mean / (arith_mean + 1e-12))
+    cumulative = np.cumsum(mean_power_per_bin)
+    rolloff_idx = int(np.searchsorted(cumulative, 0.85 * cumulative[-1], side="left"))
+    rolloff_idx = min(max(rolloff_idx, 0), len(freqs) - 1)
+    spec_rolloff = float(freqs[rolloff_idx])
+
+    try:
+        mfccs = librosa.feature.mfcc(
+            S=librosa.power_to_db(power),
+            n_mfcc=4,
+        )
+        mfcc_means = mfccs.mean(axis=1)
+    except Exception:
+        mfcc_means = np.zeros(4, dtype=np.float32)
+
+    energy = float(np.mean(S ** 2))
+    wiener_entropy = float(geo_mean / (arith_mean + 1e-12))
+
+    return np.array([
+        duration_sec,
+        freq_center, freq_bw, freq_min_val, freq_max_val,
+        fm_slope, fm_curvature,
+        spec_centroid, spec_bandwidth, spec_flatness, spec_rolloff,
+        *mfcc_means,
+        energy, wiener_entropy,
+    ], dtype=np.float32)
+
+
+def extract_spectral_features_from_spectrograms(
+    spectrograms: list[np.ndarray],
+    durations_sec: np.ndarray | list[float] | None = None,
+    freq_min: int = 30_000,
+    freq_max: int = 130_000,
+) -> np.ndarray:
+    """
+    Recompute per-call spectral features from spectrogram images.
+
+    Args:
+        spectrograms:   List of (H, W) spectrogram arrays.
+        durations_sec: Parallel list/array of call durations in seconds.
+                       If omitted, duration is set to 0 for every call.
+    """
+    if not spectrograms:
+        return np.empty((0, N_CALL_FEATURES), dtype=np.float32)
+
+    if durations_sec is None:
+        durations = np.zeros(len(spectrograms), dtype=np.float32)
+    else:
+        durations = np.asarray(durations_sec, dtype=np.float32)
+        if len(durations) != len(spectrograms):
+            raise ValueError(
+                "durations_sec must have the same length as spectrograms "
+                f"({len(durations)} != {len(spectrograms)})"
+            )
+
+    features = [
+        extract_call_features_from_spectrogram(
+            spec,
+            duration_sec=float(durations[i]),
+            freq_min=freq_min,
+            freq_max=freq_max,
+        )
+        for i, spec in enumerate(spectrograms)
+    ]
+    return np.stack(features).astype(np.float32)
+
+
+def compute_acoustic_stats_from_call_features(
+    call_features: np.ndarray,
+    recording_span_sec: float | None = None,
+) -> np.ndarray:
+    """
+    Compute the 8-d acoustic summary used by the enhanced models.
+
+    The summary is derived from per-call feature vectors so it can be rebuilt
+    for each freshly augmented sample.
+    """
+    if len(call_features) == 0:
+        return np.zeros(8, dtype=np.float32)
+
+    durations = call_features[:, 0].astype(np.float32)
+    freq_centers = call_features[:, 1].astype(np.float32)
+    freq_bw = call_features[:, 2].astype(np.float32)
+    call_count = float(len(call_features))
+    span = float(recording_span_sec) if recording_span_sec is not None else float(durations.sum())
+
+    return np.array([
+        call_count,
+        call_count / max(span, 1.0),
+        durations.mean(),
+        durations.std() if len(durations) > 1 else 0.0,
+        freq_centers.mean(),
+        freq_centers.std() if len(freq_centers) > 1 else 0.0,
+        freq_bw.mean(),
+        freq_bw.std() if len(freq_bw) > 1 else 0.0,
+    ], dtype=np.float32)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-recording extraction
 # ──────────────────────────────────────────────────────────────────────────────

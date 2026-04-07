@@ -20,6 +20,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
+import math
 import os
 import re
 import sys
@@ -27,13 +29,13 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.metrics import classification_report, confusion_matrix, f1_score as sk_f1
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
 import yaml
 
 _SQUEAKOUT_DIR = Path(__file__).parent.parent / "squeakout"
@@ -43,18 +45,20 @@ if 'pytorch_lightning' not in sys.modules:
     from unittest.mock import MagicMock
     sys.modules['pytorch_lightning'] = MagicMock()
 
-from data import infer_label_from_filename, LABEL_NAMES
+from data import LABEL_NAMES
 from data.squeakout_features import (
     SqueakOutEncoder, add_spectrogram_noise,
 )
 from data.spectral_features import (
-    extract_recording_spectral_features, summarize_call_features,
-    N_CALL_FEATURES, summary_feature_dim,
+    compute_acoustic_stats_from_call_features,
+    extract_recording_spectral_features,
+    extract_spectral_features_from_spectrograms,
+    N_CALL_FEATURES,
 )
 from train import (
-    find_recordings, compute_acoustic_stats, extract_or_load,
+    find_recordings, extract_or_load,
     extract_or_load_spectrograms,
-    pool_recordings, make_loader, train_epoch, evaluate,
+    make_loader, train_epoch, evaluate,
     ProgressLogger,
 )
 from pooling.swe import SWEPooler
@@ -134,6 +138,79 @@ def balance_class_indices(labels, seed=42):
             donor = idxs[rng.integers(0, n)]
             result.append((donor, True))
     return result
+
+
+def load_detection_durations_and_span(csv_path: Path) -> tuple[np.ndarray, float]:
+    """Return per-call durations and overall recording span from a detections CSV."""
+    df = pd.read_csv(csv_path)
+    if df.empty or "start_sec" not in df.columns or "end_sec" not in df.columns:
+        return np.empty(0, dtype=np.float32), 0.0
+
+    durations = (df["end_sec"] - df["start_sec"]).to_numpy(dtype=np.float32)
+    span = float(df["end_sec"].max()) if len(df) else 0.0
+    return durations, span
+
+
+def build_epoch_training_meta(
+    balanced_tr,
+    inner_tr,
+    enc_meta_all,
+    spec_meta_all,
+    acous_all,
+    all_specs,
+    call_durations_all,
+    recording_spans_all,
+    encoder,
+    cfg_enc,
+    cfg_spec,
+    noise_std,
+    rng,
+    encoder_only=False,
+):
+    """
+    Build one fresh training set for the current epoch.
+
+    Augmented copies are regenerated from noised spectrograms so encoder,
+    spectral, and acoustic branches stay synchronized.
+    """
+    enc_tr: list[tuple[int, list[np.ndarray]]] = []
+    spec_tr: list[tuple[int, list[np.ndarray]]] = []
+    acous_tr: list[np.ndarray] = []
+
+    for src_i, is_aug in balanced_tr:
+        real_idx = inner_tr[src_i]
+        label = enc_meta_all[real_idx][0]
+
+        if is_aug:
+            noisy_specs = add_spectrogram_noise(all_specs[real_idx], noise_std, rng)
+            noisy_enc = encoder.encode_batch(
+                noisy_specs, batch_size=cfg_enc["batch_size"]
+            )
+            enc_tr.append((label, list(noisy_enc)))
+
+            if encoder_only:
+                spec_tr.append(spec_meta_all[real_idx])
+                acous_tr.append(acous_all[real_idx])
+            else:
+                noisy_spec = extract_spectral_features_from_spectrograms(
+                    noisy_specs,
+                    durations_sec=call_durations_all[real_idx],
+                    freq_min=cfg_spec["freq_min"],
+                    freq_max=cfg_spec["freq_max"],
+                )
+                spec_tr.append((label, list(noisy_spec)))
+                acous_tr.append(
+                    compute_acoustic_stats_from_call_features(
+                        noisy_spec,
+                        recording_span_sec=recording_spans_all[real_idx],
+                    )
+                )
+        else:
+            enc_tr.append(enc_meta_all[real_idx])
+            spec_tr.append(spec_meta_all[real_idx])
+            acous_tr.append(acous_all[real_idx])
+
+    return enc_tr, spec_tr, np.stack(acous_tr).astype(np.float32)
 
 
 def pool_and_combine(enc_meta, spec_meta, enc_pooler, spec_pooler,
@@ -250,9 +327,24 @@ def cross_validate_enhanced(
     valid_groups = groups[valid_idx]
     print(f"Valid recordings: {len(valid_idx)}/{len(wav_paths)}")
 
-    # Acoustic stats for all valid recordings
-    acous_all = np.array([compute_acoustic_stats(csv_paths[i]) for i in valid_idx],
-                         dtype=np.float32)
+    # Metadata needed to rebuild non-encoder branches for noised augmentations
+    call_durations_all = []
+    recording_spans_all = []
+    for i in valid_idx:
+        durations, span = load_detection_durations_and_span(csv_paths[i])
+        call_durations_all.append(durations)
+        recording_spans_all.append(span)
+    recording_spans_all = np.asarray(recording_spans_all, dtype=np.float32)
+
+    # Acoustic stats are derived from the call-level spectral features so they
+    # can be regenerated for each fresh augmentation.
+    acous_all = np.array([
+        compute_acoustic_stats_from_call_features(
+            np.stack(spec_meta_all[i][1]),
+            recording_span_sec=recording_spans_all[i],
+        )
+        for i in range(len(spec_meta_all))
+    ], dtype=np.float32)
 
     # Pooler configs
     enc_dim = enc_meta_all[0][1][0].shape[0] if enc_meta_all else 96
@@ -286,30 +378,13 @@ def cross_validate_enhanced(
         enc_te = [enc_meta_all[i] for i in te_idx]
         spec_te = [spec_meta_all[i] for i in te_idx]
 
-        # Balance training classes (duplication only, noise applied per-epoch)
+        # Balance training classes (duplication only, fresh features built per epoch)
         tr_labels = [enc_meta_all[i][0] for i in inner_tr]
         noise_std = cfg_aug.get("noise_std", 0.05)
         if cfg_aug.get("enabled", True):
             balanced_tr = balance_class_indices(tr_labels, seed=seed + fold)
         else:
             balanced_tr = [(i, False) for i in range(len(inner_tr))]
-
-        # Build initial (un-noised) training meta for SVM/RF
-        enc_tr: list[tuple[int, list[np.ndarray]]] = []
-        spec_tr: list[tuple[int, list[np.ndarray]]] = []
-        rng_fold = np.random.default_rng(seed + fold + 1000)
-        for src_i, is_aug in balanced_tr:
-            real_idx = inner_tr[src_i]
-            label = enc_meta_all[real_idx][0]
-            if is_aug:
-                noisy_specs = add_spectrogram_noise(all_specs[real_idx], noise_std, rng_fold)
-                noisy_feats = encoder.encode_batch(
-                    noisy_specs, batch_size=cfg_enc['batch_size']
-                )
-                enc_tr.append((label, list(noisy_feats)))
-            else:
-                enc_tr.append(enc_meta_all[real_idx])
-            spec_tr.append(spec_meta_all[real_idx])
 
         # Create poolers per fold
         if pooler_name == "swe":
@@ -331,65 +406,38 @@ def cross_validate_enhanced(
             enc_pooler = PoolerRegistry.get("average", n_features=enc_dim)
             spec_pooler = PoolerRegistry.get("average", n_features=spec_dim)
 
-        # Acoustic stats for splits
-        acous_tr_real = acous_all[inner_tr]
-        n_real = len(inner_tr)
-        n_synth = len(enc_tr) - n_real
-        if n_synth > 0:
-            y_real = np.array([enc_tr[i][0] for i in range(n_real)])
-            cls_mean = {c: acous_tr_real[y_real == c].mean(0)
-                        for c in np.unique(y_real)}
-            synth_acous = np.array([cls_mean[enc_tr[n_real + j][0]]
-                                    for j in range(n_synth)])
-            acous_tr = np.vstack([acous_tr_real, synth_acous])
-        else:
-            acous_tr = acous_tr_real
-
         acous_val = acous_all[inner_val]
         acous_te = acous_all[list(te_idx)]
 
-        # Pool + combine
-        X_tr, y_tr = pool_and_combine(enc_tr, spec_tr, enc_pooler, spec_pooler, acous_tr, encoder_only)
-        X_val, y_val = pool_and_combine(enc_val, spec_val, enc_pooler, spec_pooler, acous_val, encoder_only)
-        X_te, y_te = pool_and_combine(enc_te, spec_te, enc_pooler, spec_pooler, acous_te, encoder_only)
+        # Fixed validation/test matrices; training is rebuilt every epoch.
+        X_val_raw, y_val = pool_and_combine(
+            enc_val, spec_val, enc_pooler, spec_pooler, acous_val, encoder_only
+        )
+        X_te_raw, y_te = pool_and_combine(
+            enc_te, spec_te, enc_pooler, spec_pooler, acous_te, encoder_only
+        )
 
         if fold == 0:
-            print(f"  Combined feature dim: {X_tr.shape[1]}")
-            plog.log(f"Feature dim: {X_tr.shape[1]}")
+            print(f"  Combined feature dim: {X_val_raw.shape[1]}")
+            plog.log(f"Feature dim: {X_val_raw.shape[1]}")
 
-        # Normalise (fit on training data)
-        mean = X_tr.mean(0)
-        std = np.maximum(X_tr.std(0), 1e-8)
-        X_val = (X_val - mean) / std
-        X_te = (X_te - mean) / std
-
-        cls_counts_aug = {}
-        for lbl in y_tr:
-            cls_counts_aug[lbl] = cls_counts_aug.get(lbl, 0) + 1
+        train_label_template = np.array(
+            [enc_meta_all[inner_tr[src_i]][0] for src_i, _ in balanced_tr],
+            dtype=np.int64,
+        )
+        cls_counts_aug = {
+            int(lbl): int((train_label_template == lbl).sum())
+            for lbl in np.unique(train_label_template)
+        }
         print(f"  Train after aug: {cls_counts_aug}")
 
-        # SVM/RF use single-noise training set
-        X_tr_norm = (X_tr - mean) / std
-        X_sk = np.vstack([X_tr_norm, X_val])
-        y_sk = np.concatenate([y_tr, y_val])
-
-        svm = SVC(kernel='rbf', class_weight='balanced', C=1.0, gamma='scale')
-        svm.fit(X_sk, y_sk)
-        preds_svm[te_idx[:len(y_te)]] = svm.predict(X_te)
-
-        rf = RandomForestClassifier(n_estimators=200, class_weight='balanced',
-                                    random_state=seed)
-        rf.fit(X_sk, y_sk)
-        preds_rf[te_idx[:len(y_te)]] = rf.predict(X_te)
-
-        # MLP — per-epoch input-level augmentation
-        counts = np.bincount(y_tr, minlength=n_classes).astype(float)
-        weights = len(y_tr) / (n_classes * np.maximum(counts, 1))
+        counts = np.bincount(train_label_template, minlength=n_classes).astype(float)
+        weights = len(train_label_template) / (n_classes * np.maximum(counts, 1))
         crit = nn.CrossEntropyLoss(
             weight=torch.tensor(weights, dtype=torch.float32).to(device)
         )
         model = get_model(
-            "enriched", input_dim=X_tr.shape[1], n_classes=n_classes,
+            "enriched", input_dim=X_val_raw.shape[1], n_classes=n_classes,
             hidden_dims=cfg_model.get("hidden_dims", [64]),
             dropout=cfg_model.get("dropout", 0.2),
             use_batch_norm=False,
@@ -397,67 +445,112 @@ def cross_validate_enhanced(
         opt = torch.optim.Adam(model.parameters(),
                                lr=cfg_tr.get("learning_rate", 1e-3),
                                weight_decay=cfg_tr.get("weight_decay", 1e-4))
-        val_loader = make_loader(X_val, y_val, cfg_tr.get("batch_size", 8), shuffle=False)
 
-        # Pre-generate a pool of noise realizations to avoid per-epoch re-encoding
-        N_NOISE_REALIZATIONS = 5
-        aug_indices = [(j, src_i) for j, (src_i, is_aug) in enumerate(balanced_tr) if is_aug]
-        noise_pool: list[list[tuple[int, list[np.ndarray]]]] = []
-        if aug_indices and cfg_aug.get("enabled", True):
-            for nr in range(N_NOISE_REALIZATIONS):
-                rng_nr = np.random.default_rng(seed + fold * 10000 + nr)
-                realization = {}
-                for j, src_i in aug_indices:
-                    real_idx = inner_tr[src_i]
-                    label = enc_meta_all[real_idx][0]
-                    noisy_specs = add_spectrogram_noise(
-                        all_specs[real_idx], noise_std, rng_nr
-                    )
-                    noisy_feats = encoder.encode_batch(
-                        noisy_specs, batch_size=cfg_enc['batch_size']
-                    )
-                    realization[j] = (label, list(noisy_feats))
-                noise_pool.append(realization)
+        best_svm_score, best_rf_score = -np.inf, -np.inf
+        best_svm, best_rf = None, None
+        best_svm_norm, best_rf_norm = None, None
+        stall_svm, stall_rf = 0, 0
 
-        # Pre-pool all noise realizations into ready-to-use training sets
-        pooled_train_sets = []
-        for nr in range(max(1, len(noise_pool))):
-            ep_enc: list[tuple[int, list[np.ndarray]]] = []
-            ep_spec: list[tuple[int, list[np.ndarray]]] = []
-            for j, (src_i, is_aug) in enumerate(balanced_tr):
-                real_idx = inner_tr[src_i]
-                if is_aug and noise_pool:
-                    ep_enc.append(noise_pool[nr][j])
-                else:
-                    ep_enc.append(enc_meta_all[real_idx])
-                ep_spec.append(spec_meta_all[real_idx])
-            X_nr, y_nr = pool_and_combine(
-                ep_enc, ep_spec, enc_pooler, spec_pooler, acous_tr, encoder_only
-            )
-            X_nr = (X_nr - mean) / std
-            pooled_train_sets.append((X_nr, y_nr))
-
-        best_loss, stall, best_state = float("inf"), 0, None
+        best_loss, stall_mlp, best_state = float("inf"), 0, None
+        best_mlp_norm = None
         patience = cfg_tr.get("early_stopping_patience", 40)
-        rng_ep = np.random.default_rng(seed + fold * 10000)
+        cpu_model_eval_every = max(1, int(cfg_tr.get("cpu_model_eval_every", 1)))
+        cpu_patience = max(1, math.ceil(patience / cpu_model_eval_every))
         for ep in range(1, cfg_tr.get("n_epochs", 300) + 1):
-            # Pick a random pre-computed noise realization
-            nr_idx = rng_ep.integers(0, len(pooled_train_sets))
-            X_tr_ep, y_tr_ep = pooled_train_sets[nr_idx]
+            rng_ep = np.random.default_rng(seed + fold * 10000 + ep)
+            enc_tr_ep, spec_tr_ep, acous_tr_ep = build_epoch_training_meta(
+                balanced_tr,
+                inner_tr,
+                enc_meta_all,
+                spec_meta_all,
+                acous_all,
+                all_specs,
+                call_durations_all,
+                recording_spans_all,
+                encoder,
+                cfg_enc,
+                cfg_spec,
+                noise_std,
+                rng_ep,
+                encoder_only=encoder_only,
+            )
+            X_tr_ep_raw, y_tr_ep = pool_and_combine(
+                enc_tr_ep, spec_tr_ep, enc_pooler, spec_pooler, acous_tr_ep, encoder_only
+            )
+            mean = X_tr_ep_raw.mean(0)
+            std = np.maximum(X_tr_ep_raw.std(0), 1e-8)
+            X_tr_ep = (X_tr_ep_raw - mean) / std
+            X_val = (X_val_raw - mean) / std
+
+            should_fit_cpu_models = (
+                ep == 1
+                or (cfg_aug.get("enabled", True) and ep % cpu_model_eval_every == 0)
+            )
+            if should_fit_cpu_models:
+                svm = SVC(kernel='rbf', class_weight='balanced', C=1.0, gamma='scale')
+                svm.fit(X_tr_ep, y_tr_ep)
+                svm_val_pred = svm.predict(X_val)
+                svm_score = sk_f1(y_val, svm_val_pred, average='macro', zero_division=0)
+                if svm_score > best_svm_score:
+                    best_svm_score = svm_score
+                    best_svm = deepcopy(svm)
+                    best_svm_norm = (mean.copy(), std.copy())
+                    stall_svm = 0
+                else:
+                    stall_svm += 1
+
+                rf = RandomForestClassifier(
+                    n_estimators=200,
+                    class_weight='balanced',
+                    random_state=seed + fold * 10000 + ep,
+                )
+                rf.fit(X_tr_ep, y_tr_ep)
+                rf_val_pred = rf.predict(X_val)
+                rf_score = sk_f1(y_val, rf_val_pred, average='macro', zero_division=0)
+                if rf_score > best_rf_score:
+                    best_rf_score = rf_score
+                    best_rf = deepcopy(rf)
+                    best_rf_norm = (mean.copy(), std.copy())
+                    stall_rf = 0
+                else:
+                    stall_rf += 1
+
             tr_loader = make_loader(X_tr_ep, y_tr_ep, cfg_tr.get("batch_size", 8), shuffle=True)
+            val_loader = make_loader(X_val, y_val, cfg_tr.get("batch_size", 8), shuffle=False)
 
             train_epoch(model, tr_loader, crit, opt, device)
             vm = evaluate(model, val_loader, crit, device, n_classes)
             if vm["loss"] < best_loss:
                 best_loss = vm["loss"]
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
-                stall = 0
+                best_mlp_norm = (mean.copy(), std.copy())
+                stall_mlp = 0
             else:
-                stall += 1
-                if stall >= patience:
-                    break
+                stall_mlp += 1
+
+            if ep % 10 == 0 or ep == 1:
+                print(
+                    f"  Ep {ep:4d} | "
+                    f"SVM val_f1={best_svm_score:.3f} | "
+                    f"RF val_f1={best_rf_score:.3f} | "
+                    f"MLP val_loss={best_loss:.4f}"
+                )
+
+            if stall_svm >= cpu_patience and stall_rf >= cpu_patience and stall_mlp >= patience:
+                break
+
+        if best_svm is None or best_rf is None or best_mlp_norm is None:
+            raise RuntimeError(f"Fold {fold + 1}: training did not produce valid model state")
+
+        svm_mean, svm_std = best_svm_norm
+        rf_mean, rf_std = best_rf_norm
+        preds_svm[te_idx[:len(y_te)]] = best_svm.predict((X_te_raw - svm_mean) / svm_std)
+        preds_rf[te_idx[:len(y_te)]] = best_rf.predict((X_te_raw - rf_mean) / rf_std)
+
         if best_state:
             model.load_state_dict(best_state)
+        mlp_mean, mlp_std = best_mlp_norm
+        X_te = (X_te_raw - mlp_mean) / mlp_std
         te_loader = make_loader(X_te, y_te, cfg_tr.get("batch_size", 8), shuffle=False)
         tm = evaluate(model, te_loader, crit, device, n_classes)
         preds_mlp[te_idx[:len(y_te)]] = tm["preds"]

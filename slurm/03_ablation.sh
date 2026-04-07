@@ -12,12 +12,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=usv_ablation
-#SBATCH -p scavenger-h200
-#SBATCH -A scavenger-h200
+#SBATCH -p scavenger-gpu
+#SBATCH -A naderilab
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --array=0-7
 #SBATCH --output=logs/ablation_%A_%a.out
 #SBATCH --error=logs/ablation_%A_%a.err
@@ -84,7 +84,7 @@ conda activate base
 cd "${REPO_DIR}" || { echo "ERROR: could not cd to ${REPO_DIR}"; exit 1; }
 
 python train_enhanced.py \
-    --config         config_squeakout.yaml \
+    --config         config_squeakout_ablation.yaml \
     --data_dir       "${AUDIO_DIR}" \
     --detections_dir "${DETECTIONS_DIR}" \
     --cache_dir      "${CACHE_DIR}" \

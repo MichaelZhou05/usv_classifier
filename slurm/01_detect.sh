@@ -13,9 +13,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=usv_detect
-#SBATCH -p scavenger-h200
-#SBATCH -A scavenger-h200
-#SBATCH --gres=gpu:1
+#SBATCH -p scavenger-gpu
+#SBATCH -A naderilab
+#SBATCH --gres=gpu:2080:1
 #SBATCH --array=0-999%20         # array indices auto-trimmed to actual file count;
                                   # %20 = run max 20 jobs simultaneously
 #SBATCH --cpus-per-task=2
@@ -58,7 +58,9 @@ if [ -f "${OUT_CSV}" ]; then
 fi
 
 module purge
-module load Python/3.11.3-GCCcore-12.3.0
+module load Anaconda3/2024.02
+eval "$(conda shell.bash hook)"
+conda activate base
 
 cd "${REPO_DIR}" || { echo "ERROR: could not cd to ${REPO_DIR}"; exit 1; }
 
