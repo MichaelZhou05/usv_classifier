@@ -251,7 +251,7 @@ def pool_and_combine(enc_meta, spec_meta, enc_pooler, spec_pooler,
 
 def cross_validate_enhanced(
     config, data_dir, detections_dir, cache_dir=None, n_folds=5, job_id=None,
-    encoder_only=False,
+    encoder_only=False, mlp_only=False,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed = config.get("seed", 42)
@@ -390,15 +390,15 @@ def cross_validate_enhanced(
         if pooler_name == "swe":
             enc_pooler = SWEPooler(
                 n_features=enc_dim,
-                num_slices=swe_cfg.get("num_slices", 16),
-                num_ref_points=swe_cfg.get("num_ref_points", 10),
+                num_slices=swe_cfg.get("num_slices", 128),
+                num_ref_points=swe_cfg.get("num_ref_points", 70),
                 freeze_swe=True,
                 flatten=swe_cfg.get("flatten", True),
             )
             spec_pooler = SWEPooler(
                 n_features=spec_dim,
-                num_slices=swe_cfg.get("num_slices", 16),
-                num_ref_points=swe_cfg.get("num_ref_points", 10),
+                num_slices=swe_cfg.get("num_slices", 128),
+                num_ref_points=swe_cfg.get("num_ref_points", 70),
                 freeze_swe=True,
                 flatten=swe_cfg.get("flatten", True),
             )
@@ -483,8 +483,11 @@ def cross_validate_enhanced(
             X_val = (X_val_raw - mean) / std
 
             should_fit_cpu_models = (
-                ep == 1
-                or (cfg_aug.get("enabled", True) and ep % cpu_model_eval_every == 0)
+                not mlp_only
+                and (
+                    ep == 1
+                    or (cfg_aug.get("enabled", True) and ep % cpu_model_eval_every == 0)
+                )
             )
             if should_fit_cpu_models:
                 svm = SVC(kernel='rbf', class_weight='balanced', C=1.0, gamma='scale')
@@ -536,16 +539,22 @@ def cross_validate_enhanced(
                     f"MLP val_loss={best_loss:.4f}"
                 )
 
-            if stall_svm >= cpu_patience and stall_rf >= cpu_patience and stall_mlp >= patience:
+            if mlp_only:
+                if stall_mlp >= patience:
+                    break
+            elif stall_svm >= cpu_patience and stall_rf >= cpu_patience and stall_mlp >= patience:
                 break
 
-        if best_svm is None or best_rf is None or best_mlp_norm is None:
+        if best_mlp_norm is None:
             raise RuntimeError(f"Fold {fold + 1}: training did not produce valid model state")
+        if not mlp_only and (best_svm is None or best_rf is None):
+            raise RuntimeError(f"Fold {fold + 1}: SVM/RF training did not produce valid state")
 
-        svm_mean, svm_std = best_svm_norm
-        rf_mean, rf_std = best_rf_norm
-        preds_svm[te_idx[:len(y_te)]] = best_svm.predict((X_te_raw - svm_mean) / svm_std)
-        preds_rf[te_idx[:len(y_te)]] = best_rf.predict((X_te_raw - rf_mean) / rf_std)
+        if not mlp_only:
+            svm_mean, svm_std = best_svm_norm
+            rf_mean, rf_std = best_rf_norm
+            preds_svm[te_idx[:len(y_te)]] = best_svm.predict((X_te_raw - svm_mean) / svm_std)
+            preds_rf[te_idx[:len(y_te)]] = best_rf.predict((X_te_raw - rf_mean) / rf_std)
 
         if best_state:
             model.load_state_dict(best_state)
@@ -570,7 +579,10 @@ def cross_validate_enhanced(
                   "encoder_only": encoder_only,
                   "models": {}}
 
-    for name, preds in [("SVM (rbf)", preds_svm), ("Random Forest", preds_rf), ("MLP", preds_mlp)]:
+    model_list = [("MLP", preds_mlp)]
+    if not mlp_only:
+        model_list = [("SVM (rbf)", preds_svm), ("Random Forest", preds_rf)] + model_list
+    for name, preds in model_list:
         mask = preds != -1
         t, p = valid_labels[mask], preds[mask]
         macro = sk_f1(t, p, average='macro', zero_division=0)
@@ -613,6 +625,8 @@ def main():
                         help="Disable Gaussian noise augmentation")
     parser.add_argument("--encoder_only", action="store_true",
                         help="Use only encoder features (no spectral/acoustic)")
+    parser.add_argument("--mlp_only", action="store_true",
+                        help="Train only MLP; skip SVM and Random Forest")
     parser.add_argument("--pooler", choices=["swe", "average"], default=None,
                         help="Override pooler setting from config")
     args = parser.parse_args()
@@ -629,7 +643,7 @@ def main():
     cross_validate_enhanced(
         config, args.data_dir, args.detections_dir,
         cache_dir=args.cache_dir, n_folds=args.cv_folds, job_id=args.job_id,
-        encoder_only=args.encoder_only,
+        encoder_only=args.encoder_only, mlp_only=args.mlp_only,
     )
 
 
