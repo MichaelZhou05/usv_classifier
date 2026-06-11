@@ -74,11 +74,11 @@ model:
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
-  n_epochs: 300
+  n_epochs: 200
   batch_size: 8                # small folds need multiple batches; avoids degenerate full-batch training
-  learning_rate: 0.001
-  weight_decay: 0.0001
-  early_stopping_patience: 40
+  learning_rate: 5.0e-4
+  weight_decay: 1.0e-4
+  early_stopping_patience: 50
 
 # ── Data splits ───────────────────────────────────────────────────────────────
 splits:
