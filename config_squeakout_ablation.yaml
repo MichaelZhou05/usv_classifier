@@ -59,6 +59,6 @@ splits:
 normalize_features: true
 
 finetune:
-  finetune_from_block: 10
-  lr_encoder: 0.00001
+  finetune_from_block: 10   # unfreeze blocks 10-13 for x4 extraction point
+  lr_encoder: 0.00001       # very low lr to preserve pretrained features
   lr_classifier: 0.001
