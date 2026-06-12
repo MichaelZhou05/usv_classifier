@@ -25,8 +25,8 @@ spectrogram:
   # Fixed time window per call. All calls shorter than this are zero-padded;
   # calls longer are centre-cropped. 300ms covers virtually all mouse USV calls.
   window_duration_sec: 0.30
-  freq_min: 30000              # Hz — lower bound of USV frequency crop
-  freq_max: 130000             # Hz — upper bound
+  freq_min: 30000              # Hz — lower bound of USV frequency range
+  freq_max: 130000             # Hz — upper bound of USV frequency range
   n_fft: 512
   hop_length: 64
 
@@ -78,7 +78,7 @@ training:
   batch_size: 8                # small folds need multiple batches; avoids degenerate full-batch training
   learning_rate: 5.0e-4
   weight_decay: 1.0e-4
-  early_stopping_patience: 50
+  early_stopping_patience: 40
 
 # ── Data splits ───────────────────────────────────────────────────────────────
 splits:
