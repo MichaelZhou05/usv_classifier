@@ -76,8 +76,8 @@ model:
 training:
   n_epochs: 200
   batch_size: 8                # small folds need multiple batches; avoids degenerate full-batch training
-  learning_rate: 5.0e-4
-  weight_decay: 1.0e-4
+  learning_rate: 5.0e-4        # AdamW lr; tuned for small-dataset stability
+  weight_decay: 1.0e-4        # L2 regularisation
   early_stopping_patience: 40
 
 # ── Data splits ───────────────────────────────────────────────────────────────
