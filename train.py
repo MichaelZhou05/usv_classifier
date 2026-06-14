@@ -13,8 +13,8 @@ Feature caching
 ───────────────
 Encoder inference is the most expensive step. Pass --cache_dir to save
 per-recording feature arrays as .npy files. On re-runs (e.g. when tuning
-model hyperparameters) features are loaded from disk instead of recomputed,
-cutting runtime from ~minutes to ~seconds.
+the classifier head) features are loaded from disk instead of recomputed,
+cutting runtime from minutes to seconds.
 
 Usage
 ─────
