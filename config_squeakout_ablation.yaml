@@ -12,8 +12,8 @@ encoder:
 
 spectrogram:
   window_duration_sec: 0.30
-  freq_min: 30000
-  freq_max: 130000
+  freq_min: 30000    # Hz — lower bound of USV frequency range
+  freq_max: 130000   # Hz — upper bound of USV frequency range
   n_fft: 512
   hop_length: 64
 
