@@ -68,7 +68,7 @@ model:
   # Input dim is computed at runtime as pooler.output_dim
   # average + x4: 96-dim input
   hidden_dims: [64]            # tiny: 56 training samples can't support more
-  dropout: 0.2
+  dropout: 0.25
   use_batch_norm: false        # BatchNorm unstable on tiny datasets
   use_class_weights: true      # re-weight loss by inverse class frequency
 
