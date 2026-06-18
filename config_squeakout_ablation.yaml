@@ -30,7 +30,7 @@ augmentation:
   strategy: "noise"
   n_sources: 2
   target_multiplier: 1.0
-  noise_std: 0.15
+  noise_std: 0.10
   random_seed: 42
 
 n_classes: 2
