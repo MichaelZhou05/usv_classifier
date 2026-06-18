@@ -20,7 +20,7 @@ spectrogram:
 pooler: "swe"
 
 swe:
-  num_slices: 128
+  num_slices: 256
   num_ref_points: 70
   freeze_swe: false
   flatten: false
