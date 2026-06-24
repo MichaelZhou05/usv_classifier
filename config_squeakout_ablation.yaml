@@ -42,7 +42,7 @@ model:
   use_class_weights: true
 
 training:
-  n_epochs: 300
+  n_epochs: 400
   batch_size: 16
   learning_rate: 0.001
   weight_decay: 0.0001
