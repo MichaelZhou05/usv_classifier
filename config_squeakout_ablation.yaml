@@ -45,7 +45,7 @@ training:
   n_epochs: 400
   batch_size: 16
   learning_rate: 0.001
-  weight_decay: 0.0001
+  weight_decay: 0.0005
   early_stopping_patience: 40
   cpu_model_eval_every: 10
 
