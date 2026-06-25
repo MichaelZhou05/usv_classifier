@@ -46,7 +46,7 @@ training:
   batch_size: 32
   learning_rate: 0.001
   weight_decay: 0.0005
-  early_stopping_patience: 40
+  early_stopping_patience: 50
   cpu_model_eval_every: 10
 
 splits:
