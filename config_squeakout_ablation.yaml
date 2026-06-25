@@ -21,7 +21,7 @@ pooler: "swe"
 
 swe:
   num_slices: 256
-  num_ref_points: 70
+  num_ref_points: 90
   freeze_swe: false
   flatten: false
 
