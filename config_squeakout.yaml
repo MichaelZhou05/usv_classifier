@@ -28,7 +28,7 @@ spectrogram:
   freq_min: 30000              # Hz — lower bound of USV frequency range
   freq_max: 130000             # Hz — upper bound of USV frequency range
   n_fft: 512
-  hop_length: 64
+  hop_length: 32
 
 # ── Pooling ───────────────────────────────────────────────────────────────────
 # Aggregates the per-call feature vectors into one vector per recording.
