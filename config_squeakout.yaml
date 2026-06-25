@@ -101,5 +101,5 @@ normalize_features: true
 #   blocks 10-13→ high-level semantics              (fine-tune these)
 finetune:
   finetune_from_block: 10   # unfreeze blocks 10-13 (last 4 of 14 for x4)
-  lr_encoder:   0.00001     # very low lr for pretrained blocks
+  lr_encoder:   0.000005    # very low lr for pretrained blocks
   lr_classifier: 0.001      # normal lr for the MLP head
