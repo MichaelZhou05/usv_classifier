@@ -21,4 +21,5 @@ Quick Start (Enriched Mode):
     model = EnrichedUSVClassifier(input_dim=11, n_classes=3)
 """
 
+# package version
 __version__ = "0.2.6"
